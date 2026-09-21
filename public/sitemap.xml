@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">
+  <url>
+    <loc>https://admiramerican.com/</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://admiramerican.com/?lang=en"/>
+    <xhtml:link rel="alternate" hreflang="pt" href="https://admiramerican.com/?lang=pt"/>
+    <xhtml:link rel="alternate" hreflang="es" href="https://admiramerican.com/?lang=es"/>
+    <changefreq>daily</changefreq>
+    <priority>1.0</priority>
+  </url>
+  <url>
+    <loc>https://admiramerican.com/about</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://admiramerican.com/about?lang=en"/>
+    <xhtml:link rel="alternate" hreflang="pt" href="https://admiramerican.com/about?lang=pt"/>
+    <xhtml:link rel="alternate" hreflang="es" href="https://admiramerican.com/about?lang=es"/>
+    <changefreq>weekly</changefreq>
+    <priority>0.9</priority>
+  </url>
+  <url>
+    <loc>https://admiramerican.com/programs</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://admiramerican.com/programs?lang=en"/>
+    <xhtml:link rel="alternate" hreflang="pt" href="https://admiramerican.com/programs?lang=pt"/>
+    <xhtml:link rel="alternate" hreflang="es" href="https://admiramerican.com/programs?lang=es"/>
+    <changefreq>weekly</changefreq>
+    <priority>0.9</priority>
+  </url>
+  <url>
+    <loc>https://admiramerican.com/stories</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://admiramerican.com/stories?lang=en"/>
+    <xhtml:link rel="alternate" hreflang="pt" href="https://admiramerican.com/stories?lang=pt"/>
+    <xhtml:link rel="alternate" hreflang="es" href="https://admiramerican.com/stories?lang=es"/>
+    <changefreq>daily</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://admiramerican.com/ambassadors</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://admiramerican.com/ambassadors?lang=en"/>
+    <xhtml:link rel="alternate" hreflang="pt" href="https://admiramerican.com/ambassadors?lang=pt"/>
+    <xhtml:link rel="alternate" hreflang="es" href="https://admiramerican.com/ambassadors?lang=es"/>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://admiramerican.com/get-involved</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://admiramerican.com/get-involved?lang=en"/>
+    <xhtml:link rel="alternate" hreflang="pt" href="https://admiramerican.com/get-involved?lang=pt"/>
+    <xhtml:link rel="alternate" hreflang="es" href="https://admiramerican.com/get-involved?lang=es"/>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://admiramerican.com/contact</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://admiramerican.com/contact?lang=en"/>
+    <xhtml:link rel="alternate" hreflang="pt" href="https://admiramerican.com/contact?lang=pt"/>
+    <xhtml:link rel="alternate" hreflang="es" href="https://admiramerican.com/contact?lang=es"/>
+    <changefreq>monthly</changefreq>
+    <priority>0.7</priority>
+  </url>
+</urlset>

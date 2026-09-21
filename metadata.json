@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix ADMIR — American Diplomatic Mission of International Relations",
+  "description": "Institutional humanitarian diplomacy portal and administrative CMS for ADMIR (American Diplomatic Mission of International Relations), fostering global cooperation, community relief, leadership, and peacebuilding.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

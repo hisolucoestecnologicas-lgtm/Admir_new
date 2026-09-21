@@ -1,0 +1,16 @@
+{
+  "entities": {
+    "admins": {
+      "title": "Admins",
+      "description": "Administrative users and credentials",
+      "fields": {
+        "email": { "type": "string" },
+        "name": { "type": "string" },
+        "role": { "type": "string" },
+        "authProvider": { "type": "string" },
+        "firebaseUid": { "type": "string" },
+        "status": { "type": "string" }
+      }
+    }
+  }
+}
