@@ -32,9 +32,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const res = await api.getMe();
       setUser(res.user);
+      localStorage.setItem('admir_current_user_id', res.user.id);
     } catch (e) {
       console.warn('Session expired or invalid:', e);
       localStorage.removeItem('admir_auth_token');
+      localStorage.removeItem('admir_current_user_id');
       setUser(null);
     } finally {
       setLoading(false);
@@ -48,6 +50,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const login = async (email: string, pass: string): Promise<User> => {
     const res = await api.login(email, pass);
     setUser(res.user);
+    localStorage.setItem('admir_current_user_id', res.user.id);
     return res.user;
   };
 
@@ -65,6 +68,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
 
     setUser(res.user);
+    localStorage.setItem('admir_current_user_id', res.user.id);
     return res.user;
   };
 
@@ -75,6 +79,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // ignore
     }
     await api.logout();
+    localStorage.removeItem('admir_current_user_id');
     setUser(null);
   };
 

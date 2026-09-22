@@ -1,6 +1,10 @@
 import { Firestore } from '@google-cloud/firestore';
 import fs from 'fs';
 import path from 'path';
+import { performance } from 'perf_hooks';
+
+(global as any).__startup_timers = (global as any).__startup_timers || {};
+(global as any).__startup_timers.firebaseStoreInitStart = performance.now();
 
 // Load project configurations
 let projectId = 'second-course-v3skh';
@@ -23,6 +27,8 @@ const firestore = new Firestore({
   projectId,
   databaseId,
 });
+
+(global as any).__startup_timers.firebaseStoreInitEnd = performance.now();
 
 const CHUNK_SIZE = 500 * 1024; // 500 KB per chunk (safe under 1 MB limit)
 

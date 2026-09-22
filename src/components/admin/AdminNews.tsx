@@ -11,6 +11,10 @@ import {
   Save,
   Search,
   Languages,
+  Upload,
+  FolderOpen,
+  Check,
+  RefreshCw,
 } from 'lucide-react';
 import { useSite } from '../../context/SiteContext';
 import { useAuth } from '../../context/AuthContext';
@@ -67,6 +71,58 @@ export function AdminNews() {
   const [readTimeMinutes, setReadTimeMinutes] = useState(4);
   const [featured, setFeatured] = useState(false);
   const [status, setStatus] = useState<'published' | 'draft'>('published');
+
+  // Media Library Selection State
+  const [showMediaSelector, setShowMediaSelector] = useState(false);
+  const [mediaSelectorList, setMediaSelectorList] = useState<any[]>([]);
+  const [loadingMediaSelector, setLoadingMediaSelector] = useState(false);
+  const [mediaSelectorSearch, setMediaSelectorSearch] = useState('');
+  const [uploadingHeroImage, setUploadingHeroImage] = useState(false);
+
+  const openMediaSelector = async () => {
+    setShowMediaSelector(true);
+    setLoadingMediaSelector(true);
+    try {
+      const data = await api.getMedia();
+      setMediaSelectorList(data);
+    } catch (err: any) {
+      error('Erro ao Carregar Mídia', err.message || 'Falha ao buscar biblioteca de mídia.');
+    } finally {
+      setLoadingMediaSelector(false);
+    }
+  };
+
+  const handleHeroImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setUploadingHeroImage(true);
+    try {
+      const reader = new FileReader();
+      reader.onloadend = async () => {
+        const base64String = reader.result as string;
+        try {
+          const newAsset = await api.uploadMediaFile({
+            fileName: file.name,
+            fileData: base64String,
+            mimeType: file.type,
+            title: `Hero Image - ${formPt.title || formEn.title || 'Notícia'}`,
+            tags: ['news', 'hero'],
+          });
+          setHeroImage(newAsset.url);
+          success('Sucesso!', 'Imagem enviada e associada com sucesso.');
+        } catch (err: any) {
+          error('Erro no Envio', err.message || 'Falha ao enviar arquivo de imagem.');
+        } finally {
+          setUploadingHeroImage(false);
+        }
+      };
+      reader.readAsDataURL(file);
+    } catch (err: any) {
+      error('Erro', 'Falha ao carregar arquivo local.');
+      setUploadingHeroImage(false);
+    }
+  };
 
   const openNewModal = () => {
     setIsNew(true);
@@ -721,14 +777,70 @@ export function AdminNews() {
                   </div>
                 </div>
 
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">URL da Fotografia Hero</label>
-                  <input
-                    type="url"
-                    value={heroImage}
-                    onChange={(e) => setHeroImage(e.target.value)}
-                    className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-xl"
-                  />
+                <div className="space-y-2">
+                  <label className="block text-xs font-semibold text-slate-700">Fotografia Hero da Notícia</label>
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4 p-4 border border-slate-100 rounded-2xl bg-slate-50/50">
+                    <div className="relative w-24 h-24 bg-slate-200 rounded-xl overflow-hidden border border-slate-300 shrink-0">
+                      <img
+                        src={heroImage || 'https://images.unsplash.com/photo-1542838132-92c53300491e?q=80&w=1200'}
+                        alt="Preview Hero"
+                        className="w-full h-full object-cover"
+                        onError={(e) => {
+                          (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1542838132-92c53300491e?q=80&w=1200';
+                        }}
+                      />
+                    </div>
+                    <div className="flex-1 space-y-2.5 w-full">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={heroImage}
+                          onChange={(e) => setHeroImage(e.target.value)}
+                          placeholder="/media/news/nome-da-imagem.webp"
+                          className="flex-1 bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-800 focus:outline-none focus:border-amber-500"
+                        />
+                        {heroImage && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard.writeText(heroImage);
+                              success('Copiado!', 'Caminho da imagem copiado.');
+                            }}
+                            className="p-2 border border-slate-200 rounded-xl bg-white hover:bg-slate-50 text-slate-500 transition-colors"
+                            title="Copiar URL"
+                          >
+                            <Copy className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          key="btn-open-news-selector"
+                          type="button"
+                          onClick={openMediaSelector}
+                          className="bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 font-bold px-3.5 py-2 rounded-xl text-xs flex items-center gap-1.5 cursor-pointer transition-colors"
+                        >
+                          <FolderOpen className="w-3.5 h-3.5 text-amber-600" />
+                          <span>Selecionar da Biblioteca</span>
+                        </button>
+
+                        <label className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-3.5 py-2 rounded-xl text-xs flex items-center gap-1.5 cursor-pointer transition-colors">
+                          <Upload className="w-3.5 h-3.5" />
+                          <span>{uploadingHeroImage ? 'Enviando...' : 'Inserir Nova Foto'}</span>
+                          <input
+                            type="file"
+                            accept="image/*"
+                            onChange={handleHeroImageUpload}
+                            className="hidden"
+                            disabled={uploadingHeroImage}
+                          />
+                        </label>
+                      </div>
+                      <p className="text-[10px] text-slate-400">
+                        Selecione uma imagem existente da Biblioteca ou faça upload de um novo arquivo. A imagem será associada de forma automática.
+                      </p>
+                    </div>
+                  </div>
                 </div>
 
                 <div className="flex items-center gap-6 pt-2">
@@ -774,6 +886,141 @@ export function AdminNews() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* MEDIA SELECTOR MODAL */}
+      {showMediaSelector && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[9999] flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-4xl max-h-[85vh] flex flex-col shadow-xl border border-slate-100">
+            {/* Header */}
+            <div className="p-5 border-b border-slate-200 flex items-center justify-between bg-slate-50 rounded-t-2xl">
+              <div>
+                <h3 className="text-sm font-bold font-serif-heading text-slate-900">
+                  Selecionar Foto da Biblioteca de Mídia
+                </h3>
+                <p className="text-[11px] text-slate-500">
+                  Selecione uma imagem pública homologada para a fotografia Hero da notícia.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowMediaSelector(false)}
+                className="text-slate-400 hover:text-slate-600 transition-colors p-1.5 hover:bg-slate-200/50 rounded-lg"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Search filter */}
+            <div className="px-5 py-3 border-b border-slate-100 bg-white">
+              <div className="relative">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  placeholder="Pesquisar por título ou tag..."
+                  value={mediaSelectorSearch}
+                  onChange={(e) => setMediaSelectorSearch(e.target.value)}
+                  className="w-full pl-9 pr-4 py-2 text-xs border border-slate-200 rounded-xl focus:outline-none focus:border-amber-500 bg-slate-50"
+                />
+              </div>
+            </div>
+
+            {/* Content grid */}
+            <div className="p-5 overflow-y-auto flex-1 min-h-[300px]">
+              {loadingMediaSelector ? (
+                <div className="flex flex-col items-center justify-center py-12 text-slate-400 text-xs gap-2">
+                  <RefreshCw className="w-6 h-6 animate-spin text-amber-500" />
+                  <span>Carregando mídias públicas...</span>
+                </div>
+              ) : (
+                (() => {
+                  const filteredList = mediaSelectorList.filter((m) => {
+                    const term = mediaSelectorSearch.toLowerCase();
+                    return (
+                      (m.title || '').toLowerCase().includes(term) ||
+                      (m.originalName || '').toLowerCase().includes(term) ||
+                      (m.tags || []).some((t: string) => t.toLowerCase().includes(term))
+                    );
+                  });
+
+                  if (filteredList.length === 0) {
+                    return (
+                      <div className="flex flex-col items-center justify-center py-12 text-slate-400 text-xs">
+                        <span>Nenhuma imagem correspondente localizada na biblioteca.</span>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
+                      {filteredList.map((item) => {
+                        const isSelected = heroImage === item.url;
+                        return (
+                          <button
+                            key={item.id}
+                            type="button"
+                            onClick={() => {
+                              setHeroImage(item.url);
+                              setShowMediaSelector(false);
+                            }}
+                            className={`group relative text-left rounded-xl overflow-hidden border bg-slate-50 transition-all ${
+                              isSelected
+                                ? 'border-amber-500 ring-2 ring-amber-500/20'
+                                : 'border-slate-200 hover:border-slate-300'
+                            }`}
+                          >
+                            <div className="relative aspect-video bg-slate-100 overflow-hidden">
+                              <img
+                                src={item.url}
+                                alt={item.title}
+                                className="w-full h-full object-cover transition-transform group-hover:scale-105"
+                                onError={(e) => {
+                                  (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1542838132-92c53300491e?q=80&w=1200';
+                                }}
+                              />
+                              {isSelected && (
+                                <div className="absolute inset-0 bg-amber-600/10 flex items-center justify-center backdrop-blur-[1px]">
+                                  <div className="bg-amber-600 text-white p-1 rounded-full shadow-sm">
+                                    <Check className="w-4 h-4 font-bold" />
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                            <div className="p-2.5 space-y-1">
+                              <h4 className="font-bold text-[10px] text-slate-900 truncate">
+                                {item.title || item.originalName}
+                              </h4>
+                              {item.tags && item.tags.length > 0 && (
+                                <div className="flex flex-wrap gap-0.5">
+                                  {item.tags.slice(0, 2).map((t: string, i: number) => (
+                                    <span key={i} className="text-[8px] bg-slate-200/60 text-slate-600 px-1 py-0.2 rounded">
+                                      #{t}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  );
+                })()
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="p-4 border-t border-slate-200 bg-slate-50 flex justify-end rounded-b-2xl">
+              <button
+                type="button"
+                onClick={() => setShowMediaSelector(false)}
+                className="px-4 py-2 rounded-xl border border-slate-200 text-xs font-semibold text-slate-600 bg-white hover:bg-slate-50 transition-colors cursor-pointer"
+              >
+                Fechar
+              </button>
+            </div>
           </div>
         </div>
       )}

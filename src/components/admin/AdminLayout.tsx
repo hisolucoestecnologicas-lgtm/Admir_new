@@ -36,7 +36,9 @@ import { AdminTasks } from './AdminTasks';
 import { AdminUsers } from './AdminUsers';
 import { AdminHistory } from './AdminHistory';
 import { AdminAssistant } from './AdminAssistant';
-import { Bot } from 'lucide-react';
+import { AdminMaintenance } from './AdminMaintenance';
+import { DataSyncManager } from './DataSyncManager';
+import { Bot, Wrench, Database } from 'lucide-react';
 
 export type AdminSection =
   | 'overview'
@@ -47,16 +49,24 @@ export type AdminSection =
   | 'media'
   | 'donations'
   | 'tasks'
+  | 'assistant'
+  | 'maintenance'
+  | 'sync'
   | 'users'
-  | 'history'
-  | 'assistant';
+  | 'history';
 
 export function AdminLayout() {
   const { user, isAuthenticated, isOwner, logout, hasPermission, login } = useAuth();
-  const { navigateTo } = useSite();
+  const { selectedParam, navigateTo } = useSite();
 
   const [activeSection, setActiveSection] = useState<AdminSection>('overview');
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  React.useEffect(() => {
+    if (selectedParam?.startsWith('tasks')) {
+      setActiveSection('tasks');
+    }
+  }, [selectedParam]);
 
   if (!isAuthenticated || !user) {
     return <AdminLogin />;
@@ -72,6 +82,8 @@ export function AdminLayout() {
     { id: 'donations', label: 'Painel de Doações', icon: DollarSign, perm: 'donations.view' as const },
     { id: 'tasks', label: 'Tarefas / Kanban', icon: CheckSquare, perm: 'tasks.view' as const },
     { id: 'assistant', label: 'Assistente Virtual / IA', icon: Bot, perm: 'assistant.view' as const },
+    { id: 'maintenance', label: 'Central de Manutenção', icon: Wrench, perm: 'maintenance.view' as const },
+    { id: 'sync', label: 'Sincronização de Dados', icon: Database, perm: 'sync.view' as const },
     { id: 'users', label: 'Administradores', icon: ShieldAlert, perm: 'admins.view' as const },
     { id: 'history', label: 'Histórico / Auditoria', icon: History, perm: 'history.view' as const },
   ];
@@ -229,6 +241,8 @@ export function AdminLayout() {
           {activeSection === 'donations' && <AdminDonations />}
           {activeSection === 'tasks' && <AdminTasks />}
           {activeSection === 'assistant' && <AdminAssistant />}
+          {activeSection === 'maintenance' && <AdminMaintenance />}
+          {activeSection === 'sync' && <DataSyncManager />}
           {activeSection === 'users' && <AdminUsers />}
           {activeSection === 'history' && <AdminHistory />}
         </main>

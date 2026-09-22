@@ -23,6 +23,8 @@ import {
   AssistantSettings,
   AssistantFaqItem,
   ContactRequest,
+  MaintenanceSettings,
+  MaintenanceConfig,
 } from '../types';
 
 class ApiClient {
@@ -47,15 +49,40 @@ class ApiClient {
       },
     });
 
+    const contentType = res.headers.get('content-type') || '';
+
     if (!res.ok) {
       let errorMsg = `Erro na requisição (${res.status})`;
-      try {
-        const data = await res.json();
-        if (data.error) errorMsg = data.error;
-      } catch (e) {
-        // ignore
+      if (contentType.includes('application/json')) {
+        try {
+          const data = await res.json();
+          if (data && data.error) errorMsg = data.error;
+        } catch (e) {
+          // ignore
+        }
+      } else {
+        try {
+          const text = await res.text();
+          if (text && !text.includes('<!doctype') && !text.includes('<html')) {
+            errorMsg = text.slice(0, 150);
+          }
+        } catch (e) {
+          // ignore
+        }
       }
       throw new Error(errorMsg);
+    }
+
+    if (!contentType.includes('application/json')) {
+      const text = await res.text();
+      if (text.includes('<!doctype') || text.includes('<html')) {
+        throw new Error(`Endpoint '${url}' retornou HTML em vez de JSON.`);
+      }
+      try {
+        return JSON.parse(text) as T;
+      } catch (e) {
+        throw new Error(`Resposta inválida do servidor para '${url}'.`);
+      }
     }
 
     return res.json();
@@ -113,6 +140,7 @@ class ApiClient {
       body: JSON.stringify({ email, password }),
     });
     localStorage.setItem('admir_auth_token', res.token);
+    localStorage.setItem('admir_current_user_id', res.user.id);
     return res;
   }
 
@@ -128,6 +156,7 @@ class ApiClient {
       body: JSON.stringify(payload),
     });
     localStorage.setItem('admir_auth_token', res.token);
+    localStorage.setItem('admir_current_user_id', res.user.id);
     return res;
   }
 
@@ -142,6 +171,7 @@ class ApiClient {
       // ignore
     } finally {
       localStorage.removeItem('admir_auth_token');
+      localStorage.removeItem('admir_current_user_id');
     }
   }
 
@@ -466,9 +496,30 @@ class ApiClient {
 
   public async getTasks(workspaceId?: string, workflowId?: string): Promise<Task[]> {
     const params = new URLSearchParams();
+    if (workspaceId && workspaceId.trim()) params.append('workspaceId', workspaceId.trim());
+    if (workflowId && workflowId.trim()) params.append('workflowId', workflowId.trim());
+    const q = params.toString() ? `?${params.toString()}` : '';
+    return this.request<Task[]>(`/api/tasks${q}`);
+  }
+
+  public async getTask(id: string): Promise<Task> {
+    return this.request<Task>(`/api/tasks/${id}`);
+  }
+
+  public async getEligibleTaskUsers(workspaceId?: string, workflowId?: string, search?: string): Promise<Array<{
+    id: string;
+    name: string;
+    email: string;
+    role: string;
+    title?: string;
+    avatar?: string;
+  }>> {
+    const params = new URLSearchParams();
     if (workspaceId) params.append('workspaceId', workspaceId);
     if (workflowId) params.append('workflowId', workflowId);
-    return this.request<Task[]>(`/api/tasks?${params.toString()}`);
+    if (search) params.append('search', search);
+    const q = params.toString() ? `?${params.toString()}` : '';
+    return this.request<any[]>(`/api/tasks/eligible-users${q}`);
   }
 
   public async createTask(data: Partial<Task>): Promise<Task> {
@@ -742,6 +793,47 @@ class ApiClient {
     satisfactionRate: number;
   }> {
     return this.request('/api/admin/assistant/analytics');
+  }
+
+  // --- CENTRAL DE MANUTENÇÃO ---
+  public async getPublicMaintenanceStatus(): Promise<{
+    global: MaintenanceConfig;
+    pages: Record<string, MaintenanceConfig>;
+    updatedAt: string;
+  }> {
+    return this.request('/api/maintenance/status');
+  }
+
+  public async getMaintenanceSettings(): Promise<MaintenanceSettings> {
+    return this.request<MaintenanceSettings>('/api/admin/maintenance');
+  }
+
+  public async updateMaintenanceSettings(settings: Partial<MaintenanceSettings>): Promise<MaintenanceSettings> {
+    return this.request<MaintenanceSettings>('/api/admin/maintenance', {
+      method: 'PUT',
+      body: JSON.stringify(settings),
+    });
+  }
+
+  public async toggleGlobalMaintenance(enabled: boolean): Promise<MaintenanceSettings> {
+    return this.request<MaintenanceSettings>('/api/admin/maintenance/global', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    });
+  }
+
+  public async togglePageMaintenance(pageKey: string, enabled: boolean): Promise<MaintenanceSettings> {
+    return this.request<MaintenanceSettings>(`/api/admin/maintenance/page/${pageKey}`, {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    });
+  }
+
+  public async updatePageMaintenance(pageKey: string, config: Partial<MaintenanceConfig>, enabled?: boolean): Promise<MaintenanceSettings> {
+    return this.request<MaintenanceSettings>(`/api/admin/maintenance/page/${pageKey}`, {
+      method: 'POST',
+      body: JSON.stringify({ config, enabled }),
+    });
   }
 }
 

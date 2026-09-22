@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Shield, Lock, Mail, Key } from 'lucide-react';
+import { Shield, Lock, Mail, ArrowRight, Sparkles, Key } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
 import { useSite } from '../../context/SiteContext';
@@ -9,8 +9,8 @@ export function AdminLogin() {
   const { success, error } = useToast();
   const { navigateTo } = useSite();
 
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
+  const [email, setEmail] = useState('owner@admiramerican.com');
+  const [password, setPassword] = useState('admir2026MasterKey');
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
 
@@ -40,6 +40,7 @@ export function AdminLogin() {
       );
     } catch (err: any) {
       console.error('Google sign-in error:', err);
+      // Friendly message for cancelled popup or real errors
       if (err.code === 'auth/popup-closed-by-user') {
         error('Autenticação Cancelada', 'A janela de login do Google foi fechada antes da conclusão.');
       } else {
@@ -48,6 +49,11 @@ export function AdminLogin() {
     } finally {
       setGoogleLoading(false);
     }
+  };
+
+  const setTestAccount = (testEmail: string, testPass: string) => {
+    setEmail(testEmail);
+    setPassword(testPass);
   };
 
   return (
@@ -170,6 +176,53 @@ export function AdminLogin() {
               </>
             )}
           </button>
+
+          {/* Preset Test Credentials */}
+          <div className="pt-4 border-t border-slate-800 space-y-2">
+            <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider text-center">
+              Credenciais de Acesso Pré-Configuradas:
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setTestAccount('owner@admiramerican.com', 'admir2026MasterKey')}
+                className="p-2 text-left bg-slate-800/80 hover:bg-slate-800 border border-amber-500/30 rounded-lg text-xs transition-colors"
+              >
+                <div className="font-bold text-amber-300 flex items-center gap-1">
+                  <Sparkles className="w-3 h-3" />
+                  Dono do Site
+                </div>
+                <div className="text-[10px] text-slate-400">Poder absoluto</div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTestAccount('admin@admiramerican.com', 'adminPass2026')}
+                className="p-2 text-left bg-slate-800/80 hover:bg-slate-800 border border-slate-700 rounded-lg text-xs transition-colors"
+              >
+                <div className="font-bold text-slate-200">Administrador</div>
+                <div className="text-[10px] text-slate-400">Gestão operacional</div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTestAccount('editor@admiramerican.com', 'editorPass2026')}
+                className="p-2 text-left bg-slate-800/80 hover:bg-slate-800 border border-slate-700 rounded-lg text-xs transition-colors"
+              >
+                <div className="font-bold text-slate-200">Editor</div>
+                <div className="text-[10px] text-slate-400">Conteúdo & Notícias</div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTestAccount('viewer@admiramerican.com', 'viewerPass2026')}
+                className="p-2 text-left bg-slate-800/80 hover:bg-slate-800 border border-slate-700 rounded-lg text-xs transition-colors"
+              >
+                <div className="font-bold text-slate-200">Visualizador</div>
+                <div className="text-[10px] text-slate-400">Somente leitura</div>
+              </button>
+            </div>
+          </div>
         </div>
 
         {/* Back to Public Site */}

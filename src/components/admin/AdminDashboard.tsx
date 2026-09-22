@@ -350,6 +350,15 @@ export function AdminDashboard({ onNavigate }: { onNavigate: (sec: AdminSection)
 
             <button
               type="button"
+              onClick={() => onNavigate('sync')}
+              className="p-4 text-left rounded-2xl border border-slate-100 bg-slate-50 hover:bg-slate-100 transition-colors group"
+            >
+              <div className="font-bold text-xs text-slate-900 group-hover:text-amber-700">Sincronização de Dados</div>
+              <div className="text-[11px] text-slate-500 mt-1">Importar dados de Produção para Dev com Dry Run e Backup.</div>
+            </button>
+
+            <button
+              type="button"
               onClick={() => onNavigate('history')}
               className="p-4 text-left rounded-2xl border border-slate-100 bg-slate-50 hover:bg-slate-100 transition-colors group"
             >

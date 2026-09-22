@@ -90,6 +90,17 @@ export interface GranularPermissions {
   'assistant.edit'?: boolean;
   'assistant.manage_requests'?: boolean;
 
+  // Maintenance Center (Central de Manutenção)
+  'maintenance.view'?: boolean;
+  'maintenance.edit'?: boolean;
+  'maintenance.toggle'?: boolean;
+
+  // Data Synchronization (Sincronização de Dados Produção → Dev)
+  'sync.view'?: boolean;
+  'sync.preview'?: boolean;
+  'sync.execute'?: boolean;
+  'sync.restore'?: boolean;
+
   // Granular aliases for backwards compatibility
   'donations.export_csv'?: boolean;
   'history.export_csv'?: boolean;
@@ -211,6 +222,23 @@ export const PERMISSION_GROUPS: PermissionGroup[] = [
       { key: 'assistant.view', label: 'Visualizar Painel do Assistente' },
       { key: 'assistant.edit', label: 'Configurar Assistente e FAQs' },
       { key: 'assistant.manage_requests', label: 'Gerenciar Solicitações de Atendimento' },
+    ],
+  },
+  {
+    group: 'Central de Manutenção',
+    permissions: [
+      { key: 'maintenance.view', label: 'Visualizar Central de Manutenção' },
+      { key: 'maintenance.edit', label: 'Editar Mensagens e Temas de Manutenção' },
+      { key: 'maintenance.toggle', label: 'Ativar / Desativar Modo de Manutenção' },
+    ],
+  },
+  {
+    group: 'Sincronização de Ambientes (Prod → Dev)',
+    permissions: [
+      { key: 'sync.view', label: 'Visualizar Painel de Sincronização' },
+      { key: 'sync.preview', label: 'Executar Análise / Dry Run' },
+      { key: 'sync.execute', label: 'Executar Sincronização (Produção → Dev)' },
+      { key: 'sync.restore', label: 'Restaurar Snapshot de Backup' },
     ],
   },
 ];
@@ -395,6 +423,37 @@ export interface Program {
   };
   createdAt: string;
   updatedAt: string;
+}
+
+export interface HumanitarianProjectLocation {
+  id: string;
+  programId: string;
+  programSlug: string;
+  country: string;
+  countryCode: string;
+  city: string;
+  region: 'Americas' | 'Europe' | 'Africa' | 'Global';
+  coordinates: {
+    lat: number;
+    lng: number;
+  };
+  projectTitle: {
+    en: string;
+    pt: string;
+    es: string;
+  };
+  focusArea: {
+    en: string;
+    pt: string;
+    es: string;
+  };
+  status: 'active' | 'rapid_response' | 'diplomatic_hub';
+  beneficiariesScope: {
+    en: string;
+    pt: string;
+    es: string;
+  };
+  featuredImage?: string;
 }
 
 export interface StoryTranslation {
@@ -669,11 +728,26 @@ export interface TaskDependency {
 
 export type TaskColumn = 'backlog' | 'in-progress' | 'completed' | 'on-hold' | string;
 
+export interface TaskParticipant {
+  id: string;
+  name: string;
+  email?: string;
+  role?: string;
+  title?: string;
+  avatarUrl?: string;
+  avatar?: string;
+}
+
 export interface Task {
   id: string;
+  ticketNumber?: string;
   title: string;
   description: string;
   responsible: string;
+  responsibleId?: string;
+  responsibleEmail?: string;
+  participantIds?: string[];
+  participants?: TaskParticipant[];
   priority: TaskPriority;
   dueDate: string;
   workspaceId: string;
@@ -817,3 +891,281 @@ export interface AssistantChatFeedback {
   rating: 'positive' | 'negative';
   userLanguage: string;
 }
+
+/* =========================================================================
+   CENTRAL DE MANUTENÇÃO TYPES
+========================================================================= */
+
+export interface MaintenanceTextTranslation {
+  title?: string;
+  subtitle?: string;
+  message?: string;
+  additionalText?: string;
+  buttonLabel?: string;
+}
+
+export interface MaintenanceConfig {
+  enabled: boolean;
+  themeId: string;
+  title: string;
+  subtitle?: string;
+  message: string;
+  additionalText?: string;
+  showLogo: boolean;
+  customLogoUrl?: string;
+  customImageUrl?: string;
+  showButton: boolean;
+  buttonLabel?: string;
+  buttonUrl?: string;
+  showContact: boolean;
+  showEstimatedReturn: boolean;
+  estimatedReturnDate?: string;
+  showCountdown: boolean;
+  scheduledStart?: string;
+  scheduledEnd?: string;
+  customCss?: string;
+  translations?: {
+    pt?: Partial<MaintenanceTextTranslation>;
+    en?: Partial<MaintenanceTextTranslation>;
+    es?: Partial<MaintenanceTextTranslation>;
+  };
+}
+
+export interface MaintenancePageRegistryItem {
+  key: string;
+  name: string;
+  route: string;
+  defaultTitle: string;
+  defaultMessage: string;
+  defaultThemeId: string;
+}
+
+export interface MaintenanceSettings {
+  global: MaintenanceConfig;
+  pages: Record<string, MaintenanceConfig>;
+  updatedAt: string;
+  updatedBy?: string;
+}
+
+export const PUBLIC_PAGES_REGISTRY: MaintenancePageRegistryItem[] = [
+  {
+    key: 'home',
+    name: 'Home (Página Inicial)',
+    route: '#home',
+    defaultTitle: 'Página temporariamente em manutenção',
+    defaultMessage: 'Estamos realizando atualizações nesta página. Por favor, tente novamente mais tarde.',
+    defaultThemeId: 'theme-01',
+  },
+  {
+    key: 'about',
+    name: 'About Us (Sobre a ADMIR)',
+    route: '#about',
+    defaultTitle: 'Página temporariamente em manutenção',
+    defaultMessage: 'Estamos realizando atualizações nesta página. Por favor, tente novamente mais tarde.',
+    defaultThemeId: 'theme-05',
+  },
+  {
+    key: 'programs',
+    name: 'Programs (Programas Humanitários)',
+    route: '#programs',
+    defaultTitle: 'Página temporariamente em manutenção',
+    defaultMessage: 'Estamos realizando atualizações nesta página. Por favor, tente novamente mais tarde.',
+    defaultThemeId: 'theme-04',
+  },
+  {
+    key: 'ambassadors',
+    name: 'Ambassadors (Corpo Diplomático)',
+    route: '#ambassadors',
+    defaultTitle: 'Página temporariamente em manutenção',
+    defaultMessage: 'Estamos realizando atualizações nesta página. Por favor, tente novamente mais tarde.',
+    defaultThemeId: 'theme-05',
+  },
+  {
+    key: 'get-involved',
+    name: 'Get Involved (Participe / Voluntariado)',
+    route: '#get-involved',
+    defaultTitle: 'Página temporariamente em manutenção',
+    defaultMessage: 'Estamos realizando atualizações nesta página. Por favor, tente novamente mais tarde.',
+    defaultThemeId: 'theme-06',
+  },
+  {
+    key: 'stories',
+    name: 'News & Stories (Notícias e Histórias)',
+    route: '#stories',
+    defaultTitle: 'Página temporariamente em manutenção',
+    defaultMessage: 'Estamos realizando atualizações nesta página. Por favor, tente novamente mais tarde.',
+    defaultThemeId: 'theme-02',
+  },
+  {
+    key: 'contact',
+    name: 'Contact (Contato Oficial)',
+    route: '#contact',
+    defaultTitle: 'Página temporariamente em manutenção',
+    defaultMessage: 'Estamos realizando atualizações nesta página. Por favor, tente novamente mais tarde.',
+    defaultThemeId: 'theme-03',
+  },
+  {
+    key: 'donate',
+    name: 'Donate (Doações e Apoio)',
+    route: '#donate',
+    defaultTitle: 'Página temporariamente em manutenção',
+    defaultMessage: 'Esta área está temporariamente indisponível enquanto realizamos atualizações. Por favor, tente novamente mais tarde.',
+    defaultThemeId: 'theme-08',
+  },
+];
+
+export const MAINTENANCE_PAGES_REGISTRY = PUBLIC_PAGES_REGISTRY;
+
+// ==========================================
+// DATA SYNCHRONIZATION (PRODUÇÃO → DEV) TYPES
+// ==========================================
+
+export type SyncableModuleId =
+  | 'settings'
+  | 'programs'
+  | 'stories'
+  | 'ambassadors'
+  | 'media'
+  | 'donations'
+  | 'tasks'
+  | 'taskWorkflows'
+  | 'assistant'
+  | 'maintenance'
+  | 'users'
+  | 'auditLogs'
+  | 'newsletterSubscribers'
+  | 'contactMessages';
+
+export type SyncConflictStrategy = 'source_wins' | 'target_wins' | 'manual';
+
+export interface SyncModuleInfo {
+  id: SyncableModuleId;
+  name: string;
+  description: string;
+  category: 'content' | 'operations' | 'system';
+  sourceCount: number;
+  targetCount: number;
+  dependencies: SyncableModuleId[];
+  isSensitive?: boolean;
+  hasPrivateDocs?: boolean;
+}
+
+export interface SyncConflictItem {
+  moduleId: SyncableModuleId;
+  moduleName: string;
+  recordId: string;
+  recordTitle: string;
+  sourceDiffSummary: string;
+  targetDiffSummary: string;
+  sourceUpdatedAt?: string;
+  targetUpdatedAt?: string;
+}
+
+export interface SyncMissingDependency {
+  fromModule: SyncableModuleId;
+  toModule: SyncableModuleId;
+  missingId: string;
+  referenceName: string;
+  message: string;
+}
+
+export interface SyncModuleStat {
+  moduleId: SyncableModuleId;
+  moduleName: string;
+  sourceCount: number;
+  targetCount: number;
+  newCount: number;
+  updateCount: number;
+  conflictCount: number;
+  preservedCount: number;
+  deletedCount: number; // Always 0
+}
+
+export interface SyncPreviewResult {
+  analyzedAt: string;
+  sourceEnvironment: string;
+  targetEnvironment: string;
+  selectedModules: SyncableModuleId[];
+  isFullBase: boolean;
+  modulesStats: SyncModuleStat[];
+  totalNew: number;
+  totalUpdates: number;
+  totalConflicts: number;
+  totalPreserved: number;
+  totalDeletions: number;
+  conflicts: SyncConflictItem[];
+  missingDependencies: SyncMissingDependency[];
+  warnings: string[];
+  canProceed: boolean;
+}
+
+export interface SyncBackupRecord {
+  id: string;
+  createdAt: string;
+  createdBy: {
+    id: string;
+    name: string;
+    email: string;
+  };
+  description: string;
+  modules: SyncableModuleId[];
+  recordCounts: Record<string, number>;
+  totalRecords: number;
+  filePath: string;
+}
+
+export interface SyncExecutionResult {
+  id: string;
+  startedAt: string;
+  completedAt: string;
+  durationMs: number;
+  status: 'success' | 'partial' | 'failed';
+  sourceEnvironment: string;
+  targetEnvironment: string;
+  modules: SyncableModuleId[];
+  strategy: SyncConflictStrategy;
+  stats: {
+    newRecords: number;
+    updatedRecords: number;
+    preservedRecords: number;
+    conflictsResolved: number;
+    errorsCount: number;
+  };
+  backupCreated?: {
+    id: string;
+    createdAt: string;
+    totalRecords: number;
+  };
+  logs: string[];
+  errors?: string[];
+}
+
+export type SyncConnectionState =
+  | 'PENDING_CONFIG'
+  | 'CONFIGURED_NOT_VALIDATED'
+  | 'VALIDATED'
+  | 'CONNECTION_ERROR';
+
+export interface SyncConnectionTestResult {
+  success: boolean;
+  status: SyncConnectionState;
+  statusCode?: number;
+  latencyMs?: number;
+  message: string;
+  sourceUrl?: string;
+  testedAt: string;
+}
+
+export interface SyncStatusInfo {
+  isConfigured: boolean;
+  sourceMode: 'direct_api' | 'snapshot_ready' | 'pending_config';
+  sourceUrl?: string;
+  targetEnvironment: string;
+  availableBackupsCount: number;
+  lastSync?: SyncExecutionResult;
+  inProgress: boolean;
+  modules: SyncModuleInfo[];
+  connectionState?: SyncConnectionState;
+  lastConnectionTest?: SyncConnectionTestResult;
+}
+

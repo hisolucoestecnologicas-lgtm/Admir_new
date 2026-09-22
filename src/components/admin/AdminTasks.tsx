@@ -30,16 +30,26 @@ import {
   Lock,
   Unlock,
   ShieldAlert,
+  Users,
+  Tag,
+  Copy,
+  Maximize2,
+  ExternalLink,
+  ArrowLeft,
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { useSite } from '../../context/SiteContext';
 import { api } from '../../lib/api';
-import { Task, TaskColumn, TaskPriority, TaskChecklistItem, TaskComment, TaskAttachment, TaskDependency, MediaAsset } from '../../types';
+import { Task, TaskColumn, TaskPriority, TaskChecklistItem, TaskComment, TaskAttachment, TaskDependency, MediaAsset, TaskParticipant } from '../../types';
 import { WorkflowManagerModal } from './WorkflowManagerModal';
+import { TaskResponsibleSelect, TaskParticipantsSelect, EligibleUser } from './TaskUserSelect';
+import { ExpandedTaskView } from './ExpandedTaskView';
 
 export function AdminTasks() {
   const { user, hasPermission } = useAuth();
   const { success, error } = useToast();
+  const { selectedParam, navigateTo } = useSite();
 
   const canCreate = hasPermission('tasks.create');
   const canEdit = hasPermission('tasks.edit');
@@ -56,6 +66,16 @@ export function AdminTasks() {
   const [loading, setLoading] = useState(true);
   const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null);
   const [dragOverStageId, setDragOverStageId] = useState<string | null>(null);
+
+  // Expanded Task View states
+  const [expandedTaskId, setExpandedTaskId] = useState<string | null>(() => {
+    if (selectedParam && selectedParam.startsWith('tasks/')) {
+      return selectedParam.replace('tasks/', '').trim() || null;
+    }
+    return null;
+  });
+  const [expandedTask, setExpandedTask] = useState<Task | null>(null);
+  const [loadingExpandedTask, setLoadingExpandedTask] = useState<boolean>(false);
 
   // Modals
   const [showNewModal, setShowNewModal] = useState(false);
@@ -101,6 +121,67 @@ export function AdminTasks() {
   } | null>(null);
   const [selectedDepTaskId, setSelectedDepTaskId] = useState<string>('');
   const [isAddingDep, setIsAddingDep] = useState(false);
+
+  const getTaskUrl = (taskId: string) => {
+    return `${window.location.origin}${window.location.pathname}#admin/tasks/${taskId}`;
+  };
+
+  const handleCopyTaskLink = async (taskId: string) => {
+    const url = getTaskUrl(taskId);
+    try {
+      await navigator.clipboard.writeText(url);
+      success('Link Copiado!', 'O link direto para a tarefa foi copiado para a área de transferência.');
+    } catch (err) {
+      error('Erro ao copiar', 'Não foi possível copiar o link.');
+    }
+  };
+
+  const handleOpenInNewTab = (taskId: string) => {
+    const url = getTaskUrl(taskId);
+    window.open(url, '_blank', 'noopener,noreferrer');
+  };
+
+  const handleExpandTask = (taskToExpand: Task) => {
+    setSelectedTask(null);
+    setIsEditing(false);
+    setExpandedTaskId(taskToExpand.id);
+    setExpandedTask(taskToExpand);
+    navigateTo('admin', `tasks/${taskToExpand.id}`);
+  };
+
+  const handleBackToKanban = () => {
+    setExpandedTaskId(null);
+    setExpandedTask(null);
+    navigateTo('admin', 'tasks');
+    fetchTasks();
+  };
+
+  const loadExpandedTask = async (id: string) => {
+    setLoadingExpandedTask(true);
+    try {
+      const t = await api.getTask(id);
+      setExpandedTask(t);
+    } catch (err: any) {
+      console.error('Erro ao carregar tarefa expandida:', err);
+      setExpandedTask(null);
+      error('Tarefa Não Encontrada', 'A tarefa solicitada não foi localizada.');
+    } finally {
+      setLoadingExpandedTask(false);
+    }
+  };
+
+  useEffect(() => {
+    if (selectedParam && selectedParam.startsWith('tasks/')) {
+      const id = selectedParam.replace('tasks/', '').trim();
+      if (id) {
+        setExpandedTaskId(id);
+        loadExpandedTask(id);
+      }
+    } else if (selectedParam === 'tasks' || !selectedParam) {
+      setExpandedTaskId(null);
+      setExpandedTask(null);
+    }
+  }, [selectedParam]);
 
   const fetchDependencies = async () => {
     try {
@@ -184,9 +265,33 @@ export function AdminTasks() {
   const [modalStageId, setModalStageId] = useState<string>('');
   const [dueDate, setDueDate] = useState('');
   const [responsible, setResponsible] = useState('');
+  const [responsibleId, setResponsibleId] = useState<string>('');
+  const [selectedParticipants, setSelectedParticipants] = useState<TaskParticipant[]>([]);
+  const [eligibleUsers, setEligibleUsers] = useState<EligibleUser[]>([]);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+
+  const fetchEligibleUsers = async () => {
+    try {
+      const list = await api.getEligibleTaskUsers();
+      setEligibleUsers(list || []);
+    } catch (e: any) {
+      console.error('Erro ao buscar usuários elegíveis', e);
+    }
+  };
+
+  const resetForm = () => {
+    setTitle('');
+    setDescription('');
+    setDueDate('');
+    setPriority('medium');
+    setResponsible('');
+    setResponsibleId('');
+    setSelectedParticipants([]);
+  };
 
   const fetchKanbanConfig = async () => {
     try {
+      await fetchEligibleUsers();
       const ws = await api.getWorkspaces();
       setWorkspaces(ws);
       if (ws.length > 0) {
@@ -276,6 +381,8 @@ export function AdminTasks() {
       setPriority(selectedTask.priority);
       setDueDate(selectedTask.dueDate || '');
       setResponsible(selectedTask.responsible || '');
+      setResponsibleId(selectedTask.responsibleId || '');
+      setSelectedParticipants(selectedTask.participants || []);
       setModalWorkspaceId(selectedTask.workspaceId);
       setModalWorkflowId(selectedTask.workflowId);
       setModalStageId(selectedTask.stageId);
@@ -294,7 +401,7 @@ export function AdminTasks() {
     }
 
     try {
-      await api.createTask({
+      const newTask = await api.createTask({
         title: title.trim(),
         description: description.trim(),
         workspaceId: modalWorkspaceId,
@@ -302,14 +409,18 @@ export function AdminTasks() {
         stageId: modalStageId,
         priority,
         dueDate: dueDate || new Date().toISOString().slice(0, 10),
-        responsible: responsible.trim() || user?.name || 'Diplomata ADMIR',
+        responsible: responsible.trim() || '',
+        responsibleId: responsibleId || undefined,
+        participantIds: selectedParticipants.map(p => p.id),
       });
 
-      success('Tarefa Criada!', 'A tarefa foi adicionada ao quadro operacional.');
+      setTasks(prev => [newTask, ...prev]);
       setShowNewModal(false);
-      setTitle('');
-      setDescription('');
-      // Reset selections to defaults if needed or keep current
+      resetForm();
+      success(
+        'Tarefa Criada!',
+        newTask.ticketNumber ? `Ticket gerado: ${newTask.ticketNumber}` : 'Adicionada ao quadro com sucesso.'
+      );
       fetchTasks();
     } catch (err: any) {
       error('Erro ao criar tarefa', err.message);
@@ -330,6 +441,8 @@ export function AdminTasks() {
         priority,
         dueDate: dueDate || undefined,
         responsible: responsible.trim(),
+        responsibleId: responsibleId || undefined,
+        participantIds: selectedParticipants.map(p => p.id),
       });
 
       success('Tarefa Atualizada!', 'As alterações foram salvas com sucesso.');
@@ -710,6 +823,63 @@ export function AdminTasks() {
     }
   };
 
+  if (expandedTaskId) {
+    if (loadingExpandedTask) {
+      return (
+        <div className="py-24 flex flex-col items-center justify-center gap-3 text-slate-400">
+          <Loader2 className="w-8 h-8 animate-spin text-amber-600" />
+          <p className="text-xs font-semibold">Carregando detalhes da tarefa...</p>
+        </div>
+      );
+    }
+
+    if (!expandedTask) {
+      return (
+        <div className="bg-white rounded-3xl p-8 border border-slate-200 shadow-sm text-center max-w-lg mx-auto my-12 space-y-4">
+          <div className="w-12 h-12 rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center mx-auto">
+            <AlertCircle className="w-6 h-6" />
+          </div>
+          <h3 className="text-lg font-bold text-slate-900 font-serif-heading">Tarefa Não Encontrada</h3>
+          <p className="text-xs text-slate-500">
+            A tarefa solicitada (ID: <span className="font-mono text-slate-700 font-bold">{expandedTaskId}</span>) não foi localizada ou foi excluída.
+          </p>
+          <button
+            type="button"
+            onClick={handleBackToKanban}
+            className="inline-flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition-colors shadow-sm cursor-pointer"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            <span>Voltar ao Quadro Kanban</span>
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <ExpandedTaskView
+        task={expandedTask}
+        workspaces={workspaces}
+        workflows={workflows}
+        stages={stages}
+        eligibleUsers={eligibleUsers}
+        canEdit={canEdit}
+        canDelete={canDelete}
+        canMove={canMove}
+        onBack={handleBackToKanban}
+        onTaskUpdated={(updated) => {
+          setExpandedTask(updated);
+          setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+        }}
+        onDeleteTask={async (taskId) => {
+          await handleDelete(taskId);
+          handleBackToKanban();
+        }}
+        onOpenInNewTab={handleOpenInNewTab}
+        onCopyLink={handleCopyTaskLink}
+      />
+    );
+  }
+
   return (
     <div className="space-y-6 animate-in fade-in duration-150">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -761,11 +931,63 @@ export function AdminTasks() {
           {canCreate && (
             <button
               type="button"
-              onClick={() => setShowNewModal(true)}
+              onClick={() => {
+                resetForm();
+                setShowNewModal(true);
+              }}
               className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-4 py-2.5 rounded-xl text-xs flex items-center gap-1.5 shadow-sm transition-colors"
             >
               <Plus className="w-4 h-4" />
               <span>Nova Tarefa</span>
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Real-time Search & Filter Bar */}
+      <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-white p-3 rounded-2xl border border-slate-200/80 shadow-2xs">
+        <div className="relative flex-1 max-w-md">
+          <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+          <input
+            type="text"
+            placeholder="Buscar por Ticket (ex: ADMIR-000001), título, responsável ou participante..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full pl-9 pr-8 py-2 text-xs border border-slate-200 rounded-xl focus:ring-2 focus:ring-amber-500 focus:outline-none placeholder:text-slate-400"
+          />
+          {searchQuery && (
+            <button
+              type="button"
+              onClick={() => setSearchQuery('')}
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 text-slate-400 hover:text-slate-600"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+
+        <div className="flex items-center gap-3 text-xs text-slate-500">
+          <span className="font-medium">
+            Exibindo <strong className="text-slate-800">
+              {tasks.filter((t) => {
+                if (!searchQuery.trim()) return true;
+                const q = searchQuery.toLowerCase().trim();
+                const matchTicket = t.ticketNumber ? t.ticketNumber.toLowerCase().includes(q) : false;
+                const matchTitle = t.title ? t.title.toLowerCase().includes(q) : false;
+                const matchDesc = t.description ? t.description.toLowerCase().includes(q) : false;
+                const matchResponsible = t.responsible ? t.responsible.toLowerCase().includes(q) : false;
+                const matchParticipants = t.participants ? t.participants.some(p => p.name.toLowerCase().includes(q) || (p.email && p.email.toLowerCase().includes(q))) : false;
+                return matchTicket || matchTitle || matchDesc || matchResponsible || matchParticipants;
+              }).length}
+            </strong> de <strong className="text-slate-800">{tasks.length}</strong> tarefas
+          </span>
+          {searchQuery && (
+            <button
+              type="button"
+              onClick={() => setSearchQuery('')}
+              className="text-[11px] font-bold text-amber-700 hover:underline"
+            >
+              Limpar filtro
             </button>
           )}
         </div>
@@ -778,7 +1000,17 @@ export function AdminTasks() {
           style={{ scrollbarWidth: 'thin' }}
         >
           {stages.sort((a, b) => a.orderIndex - b.orderIndex).map(stage => {
-              const stageTasks = tasks.filter(t => t.stageId === stage.id);
+              const stageTasks = tasks.filter(t => {
+                if (t.stageId !== stage.id) return false;
+                if (!searchQuery.trim()) return true;
+                const q = searchQuery.toLowerCase().trim();
+                const matchTicket = t.ticketNumber ? t.ticketNumber.toLowerCase().includes(q) : false;
+                const matchTitle = t.title ? t.title.toLowerCase().includes(q) : false;
+                const matchDesc = t.description ? t.description.toLowerCase().includes(q) : false;
+                const matchResponsible = t.responsible ? t.responsible.toLowerCase().includes(q) : false;
+                const matchParticipants = t.participants ? t.participants.some(p => p.name.toLowerCase().includes(q) || (p.email && p.email.toLowerCase().includes(q))) : false;
+                return matchTicket || matchTitle || matchDesc || matchResponsible || matchParticipants;
+              });
               const isOver = dragOverStageId === stage.id;
 
               return (
@@ -827,7 +1059,17 @@ export function AdminTasks() {
                             }`} />
 
                             <div className="flex items-center justify-between pl-1">
-                              {getPriorityBadge(t.priority)}
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                {t.ticketNumber && (
+                                  <span 
+                                    className="font-mono text-[10px] font-bold text-amber-900 bg-amber-100/90 px-1.5 py-0.5 rounded border border-amber-200/80 shadow-2xs tracking-tight"
+                                    title={`Ticket: ${t.ticketNumber}`}
+                                  >
+                                    {t.ticketNumber}
+                                  </span>
+                                )}
+                                {getPriorityBadge(t.priority)}
+                              </div>
                               {t.dueDate && (
                                 <span className={`text-[10px] flex items-center gap-1 font-medium ${
                                   new Date(t.dueDate) < new Date() ? 'text-rose-600' : 'text-slate-400'
@@ -896,17 +1138,32 @@ export function AdminTasks() {
                               </div>
                             )}
 
-                            <div className="pt-3 border-t border-slate-100 flex items-center justify-between pl-1">
-                              <div className="flex items-center gap-1.5 min-w-0">
-                                <div className="w-5 h-5 rounded-full bg-slate-100 flex items-center justify-center border border-slate-200 flex-shrink-0">
-                                  <User className="w-2.5 h-2.5 text-slate-400" />
+                            <div className="pt-2.5 border-t border-slate-100 flex items-center justify-between pl-1 gap-2">
+                              <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                                <div 
+                                  className="flex items-center gap-1 min-w-0" 
+                                  title={`Responsável Principal: ${t.responsible || 'Não atribuído'}${t.responsibleEmail ? ` (${t.responsibleEmail})` : ''}`}
+                                >
+                                  <div className="w-5 h-5 rounded-full bg-amber-100 text-amber-800 flex items-center justify-center border border-amber-200 flex-shrink-0 text-[9px] font-bold">
+                                    {t.responsible ? t.responsible.slice(0, 2).toUpperCase() : <User className="w-2.5 h-2.5 text-slate-400" />}
+                                  </div>
+                                  <span className="text-[10px] font-semibold text-slate-600 truncate max-w-[90px]">
+                                    {t.responsible || 'Não atribuído'}
+                                  </span>
                                 </div>
-                                <span className="text-[10px] font-semibold text-slate-500 truncate">
-                                  {t.responsible || 'Não atribuído'}
-                                </span>
+
+                                {t.participants && t.participants.length > 0 && (
+                                  <div 
+                                    className="flex items-center gap-0.5 flex-shrink-0 bg-slate-100 text-slate-700 px-1.5 py-0.5 rounded-md border border-slate-200 text-[9px] font-bold"
+                                    title={`Participantes: ${t.participants.map(p => p.name).join(', ')}`}
+                                  >
+                                    <Users className="w-2.5 h-2.5 text-slate-400" />
+                                    <span>+{t.participants.length}</span>
+                                  </div>
+                                )}
                               </div>
 
-                              <div className="flex items-center" onClick={(e) => e.stopPropagation()}>
+                              <div className="flex items-center flex-shrink-0" onClick={(e) => e.stopPropagation()}>
                                 {canMove && (
                                   <select
                                     value={t.stageId}
@@ -1048,13 +1305,33 @@ export function AdminTasks() {
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">Responsável</label>
-                <input
-                  type="text"
-                  placeholder="Nome do diplomata ou voluntário responsável"
-                  value={responsible}
-                  onChange={(e) => setResponsible(e.target.value)}
-                  className="w-full px-3.5 py-2.5 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-amber-500 focus:outline-none"
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Responsável Principal
+                </label>
+                <TaskResponsibleSelect
+                  eligibleUsers={eligibleUsers}
+                  selectedId={responsibleId}
+                  selectedName={responsible}
+                  onChange={(u, manual) => {
+                    if (u) {
+                      setResponsibleId(u.id);
+                      setResponsible(u.name);
+                    } else {
+                      setResponsibleId('');
+                      setResponsible(manual || '');
+                    }
+                  }}
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Participantes da Demanda
+                </label>
+                <TaskParticipantsSelect
+                  eligibleUsers={eligibleUsers}
+                  selectedParticipants={selectedParticipants}
+                  onChange={(updated) => setSelectedParticipants(updated)}
                 />
               </div>
 
@@ -1085,7 +1362,21 @@ export function AdminTasks() {
           <div className="bg-white rounded-3xl max-w-xl w-full p-6 sm:p-8 space-y-6 max-h-[90vh] overflow-y-auto shadow-2xl">
             <div className="flex items-start justify-between border-b border-slate-100 pb-3">
               <div className="flex-1">
-                <div className="flex items-center gap-2 mb-1">
+                <div className="flex flex-wrap items-center gap-2 mb-1.5">
+                  {selectedTask.ticketNumber && (
+                    <span 
+                      className="font-mono text-xs font-bold text-amber-900 bg-amber-100/90 px-2.5 py-0.5 rounded-lg border border-amber-300 shadow-2xs tracking-wide flex items-center gap-1.5 cursor-pointer hover:bg-amber-200/90 transition-colors"
+                      title="Clique para copiar o número do Ticket"
+                      onClick={() => {
+                        navigator.clipboard.writeText(selectedTask.ticketNumber!);
+                        success('Ticket copiado!', selectedTask.ticketNumber!);
+                      }}
+                    >
+                      <Tag className="w-3 h-3 text-amber-700" />
+                      <span>{selectedTask.ticketNumber}</span>
+                      <Copy className="w-2.5 h-2.5 text-amber-600 opacity-60 ml-0.5" />
+                    </span>
+                  )}
                   {getPriorityBadge(selectedTask.priority)}
                   <span className="text-[10px] text-slate-400 uppercase font-bold tracking-wider">
                     {workspaces.find(w => w.id === selectedTask.workspaceId)?.name} / {workflows.find(w => w.id === selectedTask.workflowId)?.name}
@@ -1104,16 +1395,41 @@ export function AdminTasks() {
                   </h3>
                 )}
               </div>
-              <div className="flex items-center gap-2 ml-4">
+              <div className="flex items-center gap-1.5 ml-4">
+                <button
+                  type="button"
+                  onClick={() => handleExpandTask(selectedTask)}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-xl bg-slate-100 hover:bg-amber-50 hover:text-amber-900 text-slate-700 transition-colors shadow-2xs"
+                  title="Expandir tarefa em tela cheia"
+                >
+                  <Maximize2 className="w-3.5 h-3.5 text-amber-700" />
+                  <span className="hidden sm:inline text-[11px]">Expandir</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleOpenInNewTab(selectedTask.id)}
+                  className="p-1.5 text-slate-500 hover:text-amber-700 hover:bg-slate-100 rounded-xl transition-colors"
+                  title="Abrir em Nova Aba"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleCopyTaskLink(selectedTask.id)}
+                  className="p-1.5 text-slate-500 hover:text-amber-700 hover:bg-slate-100 rounded-xl transition-colors"
+                  title="Copiar Link da Tarefa"
+                >
+                  <Link2 className="w-3.5 h-3.5" />
+                </button>
                 {canEdit && !isEditing && (
                   <button 
                     onClick={() => setIsEditing(true)}
-                    className="text-xs font-bold text-amber-600 hover:text-amber-700"
+                    className="text-xs font-bold text-amber-600 hover:text-amber-700 px-2 py-1 hover:bg-amber-50 rounded-xl"
                   >
                     Editar
                   </button>
                 )}
-                <button type="button" onClick={() => { setSelectedTask(null); setIsEditing(false); }} className="p-1 text-slate-400 hover:text-slate-800">
+                <button type="button" onClick={() => { setSelectedTask(null); setIsEditing(false); }} className="p-1 text-slate-400 hover:text-slate-800 rounded-xl">
                   <X className="w-5 h-5" />
                 </button>
               </div>
@@ -1141,18 +1457,33 @@ export function AdminTasks() {
                 </div>
               </div>
               <div className="space-y-1">
-                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">Responsável</label>
+                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">Responsável Principal</label>
                 {isEditing ? (
-                  <input
-                    type="text"
-                    value={responsible}
-                    onChange={(e) => setResponsible(e.target.value)}
-                    className="w-full text-xs font-semibold text-slate-700 border-b border-slate-200 focus:outline-none"
+                  <TaskResponsibleSelect
+                    eligibleUsers={eligibleUsers}
+                    selectedId={responsibleId}
+                    selectedName={responsible}
+                    onChange={(u, manual) => {
+                      if (u) {
+                        setResponsibleId(u.id);
+                        setResponsible(u.name);
+                      } else {
+                        setResponsibleId('');
+                        setResponsible(manual || '');
+                      }
+                    }}
                   />
                 ) : (
-                  <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
-                    <User className="w-3.5 h-3.5 text-slate-400" />
-                    {selectedTask.responsible || 'Não atribuído'}
+                  <div className="flex items-center gap-2 text-xs font-semibold text-slate-700">
+                    <div className="w-6 h-6 rounded-full bg-amber-100 text-amber-800 border border-amber-200 flex items-center justify-center text-[10px] font-bold flex-shrink-0">
+                      {selectedTask.responsible ? selectedTask.responsible.slice(0, 2).toUpperCase() : <User className="w-3 h-3 text-slate-400" />}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="truncate">{selectedTask.responsible || 'Não atribuído'}</div>
+                      {selectedTask.responsibleEmail && (
+                        <div className="text-[10px] text-slate-400 font-normal truncate">{selectedTask.responsibleEmail}</div>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
@@ -1189,6 +1520,47 @@ export function AdminTasks() {
                   <div>{getPriorityBadge(selectedTask.priority)}</div>
                 )}
               </div>
+            </div>
+
+            {/* Participantes da Demanda Section */}
+            <div className="space-y-1.5 p-3.5 rounded-2xl bg-slate-50/80 border border-slate-200">
+              <div className="flex items-center justify-between">
+                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1.5">
+                  <Users className="w-3.5 h-3.5 text-amber-600" />
+                  <span>Participantes da Demanda ({isEditing ? selectedParticipants.length : (selectedTask.participants?.length || 0)})</span>
+                </label>
+              </div>
+
+              {isEditing ? (
+                <TaskParticipantsSelect
+                  eligibleUsers={eligibleUsers}
+                  selectedParticipants={selectedParticipants}
+                  onChange={(updated) => setSelectedParticipants(updated)}
+                />
+              ) : (
+                <div>
+                  {selectedTask.participants && selectedTask.participants.length > 0 ? (
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      {selectedTask.participants.map((p) => (
+                        <div 
+                          key={p.id}
+                          className="flex items-center gap-2 px-2.5 py-1.5 bg-white border border-slate-200 rounded-xl shadow-2xs text-xs"
+                        >
+                          <div className="w-5 h-5 rounded-full bg-amber-600 text-white flex items-center justify-center font-bold text-[9px] flex-shrink-0">
+                            {p.name.slice(0, 2).toUpperCase()}
+                          </div>
+                          <div className="min-w-0">
+                            <span className="font-semibold text-slate-800 truncate block max-w-[150px]">{p.name}</span>
+                            {p.email && <span className="text-[9px] text-slate-400 truncate block">{p.email}</span>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-400 italic">Nenhum participante adicional registrado nesta demanda.</p>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="space-y-2">

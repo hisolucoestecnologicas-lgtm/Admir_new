@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { SiteSettings, Program, Story, Ambassador } from '../types';
-import { INITIAL_SITE_SETTINGS, INITIAL_PROGRAMS, INITIAL_STORIES, INITIAL_AMBASSADORS } from '../data/initialData';
+import { SiteSettings, Program, Story, Ambassador, MaintenanceSettings, MaintenanceConfig } from '../types';
+import { INITIAL_SITE_SETTINGS, INITIAL_PROGRAMS, INITIAL_STORIES, INITIAL_AMBASSADORS, INITIAL_MAINTENANCE_SETTINGS } from '../data/initialData';
 import { api } from '../lib/api';
 
 export type AppView =
@@ -26,6 +26,7 @@ interface SiteContextValue {
   programs: Program[];
   stories: Story[];
   ambassadors: Ambassador[];
+  maintenanceSettings: MaintenanceSettings;
   loading: boolean;
   language: SupportedLanguage;
   setLanguage: (lang: SupportedLanguage) => void;
@@ -41,6 +42,8 @@ interface SiteContextValue {
   refreshStories: () => Promise<void>;
   refreshPrograms: () => Promise<void>;
   updateLocalSettings: (updates: Partial<SiteSettings>) => void;
+  getMaintenanceForView: (view?: AppView) => { inMaintenance: boolean; config: MaintenanceConfig; pageTitle?: string };
+  isPageUnderMaintenance: (pageKeyOrView: string) => boolean;
 }
 
 const SiteContext = createContext<SiteContextValue | null>(null);
@@ -50,6 +53,7 @@ export function SiteProvider({ children }: { children: React.ReactNode }) {
   const [programs, setPrograms] = useState<Program[]>(INITIAL_PROGRAMS);
   const [stories, setStories] = useState<Story[]>(INITIAL_STORIES);
   const [ambassadors, setAmbassadors] = useState<Ambassador[]>(INITIAL_AMBASSADORS);
+  const [maintenanceSettings, setMaintenanceSettings] = useState<MaintenanceSettings>(INITIAL_MAINTENANCE_SETTINGS);
   const [loading, setLoading] = useState(true);
   const [language, setLanguageState] = useState<SupportedLanguage>(() => {
     try {
@@ -89,16 +93,25 @@ export function SiteProvider({ children }: { children: React.ReactNode }) {
 
   const refetchAll = useCallback(async () => {
     try {
-      const [s, p, st, a] = await Promise.all([
+      const [s, p, st, a, m] = await Promise.all([
         api.getSettings().catch(() => INITIAL_SITE_SETTINGS),
         api.getPrograms().catch(() => INITIAL_PROGRAMS),
         api.getStories().catch(() => INITIAL_STORIES),
         api.getAmbassadors().catch(() => INITIAL_AMBASSADORS),
+        api.getPublicMaintenanceStatus().catch(() => INITIAL_MAINTENANCE_SETTINGS),
       ]);
       setSettings(s);
       setPrograms(p);
       setStories(st);
       setAmbassadors(a);
+      if (m && m.global) {
+        setMaintenanceSettings({
+          global: m.global,
+          pages: m.pages || {},
+          updatedAt: m.updatedAt || new Date().toISOString(),
+          updatedBy: 'Sistema',
+        });
+      }
     } catch (e) {
       console.error('Failed to fetch site data:', e);
     } finally {
@@ -154,7 +167,7 @@ export function SiteProvider({ children }: { children: React.ReactNode }) {
         ].includes(view)
       ) {
         setCurrentView(view);
-        setSelectedParam(null);
+        setSelectedParam(parts.slice(1).join('/') || null);
       }
     };
 
@@ -172,22 +185,97 @@ export function SiteProvider({ children }: { children: React.ReactNode }) {
     else if (view === 'story-detail' && param) newHash = `stories/${param}`;
     else if (view === 'ambassador-detail' && param) newHash = `ambassadors/${param}`;
     else if (view === 'accept-invite' && param) newHash = `accept-invite/${param}`;
+    else if (view === 'admin' && param) newHash = `admin/${param}`;
+    else if (view === 'admin') newHash = 'admin';
 
     window.location.hash = newHash;
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, []);
 
-  const openDonationModal = useCallback((amount?: number, cause?: string) => {
-    setDonationPreset({ amount, cause });
-    setIsDonationModalOpen(true);
+  const updateLocalSettings = useCallback((updates: Partial<SiteSettings>) => {
+    setSettings((prev) => ({ ...prev, ...updates }));
   }, []);
+
+  const getMaintenanceForView = useCallback(
+    (view?: AppView): { inMaintenance: boolean; config: MaintenanceConfig; pageTitle?: string } => {
+      const targetView = view || currentView;
+
+      // Standalone & Admin views NEVER blocked by maintenance
+      if (['admin', 'accept-invite', 'ambassador-onboarding'].includes(targetView)) {
+        return { inMaintenance: false, config: maintenanceSettings.global };
+      }
+
+      // Check Global Maintenance first (Global ON takes priority over all individual pages)
+      if (maintenanceSettings.global?.enabled) {
+        return {
+          inMaintenance: true,
+          config: maintenanceSettings.global,
+          pageTitle: 'Site Global',
+        };
+      }
+
+      // Page-specific mapping
+      const pageKeyMap: Record<string, { key: string; name: string }> = {
+        home: { key: 'home', name: 'Início' },
+        about: { key: 'about', name: 'Sobre Nós' },
+        programs: { key: 'programs', name: 'Programas Humanitários' },
+        'program-detail': { key: 'programs', name: 'Programas Humanitários' },
+        stories: { key: 'stories', name: 'Notícias & Histórias' },
+        'story-detail': { key: 'stories', name: 'Notícias & Histórias' },
+        ambassadors: { key: 'ambassadors', name: 'Corpo Diplomático' },
+        'ambassador-detail': { key: 'ambassadors', name: 'Corpo Diplomático' },
+        'get-involved': { key: 'get-involved', name: 'Como Participar' },
+        donate: { key: 'donate', name: 'Doações & Apoio' },
+        contact: { key: 'contact', name: 'Contato Oficial' },
+      };
+
+      const mapped = pageKeyMap[targetView];
+      if (mapped && maintenanceSettings.pages?.[mapped.key]?.enabled) {
+        return {
+          inMaintenance: true,
+          config: maintenanceSettings.pages[mapped.key],
+          pageTitle: mapped.name,
+        };
+      }
+
+      return { inMaintenance: false, config: maintenanceSettings.global };
+    },
+    [currentView, maintenanceSettings]
+  );
+
+  const isPageUnderMaintenance = useCallback(
+    (pageKeyOrView: string): boolean => {
+      const res = getMaintenanceForView(pageKeyOrView as AppView);
+      return res.inMaintenance;
+    },
+    [getMaintenanceForView]
+  );
+
+  // Central Gate for Donation Flow
+  const openDonationModal = useCallback(
+    (amount?: number, cause?: string) => {
+      // 1. Preserve donation presets without data loss or corruption
+      if (amount !== undefined || cause !== undefined) {
+        setDonationPreset({ amount, cause });
+      }
+
+      // 2. Central Gate: Check maintenance state (Global first, then Donate page)
+      const maintenanceStatus = getMaintenanceForView('donate');
+      if (maintenanceStatus.inMaintenance) {
+        // Donate (or Global) is in maintenance: block DonationModal and direct to donate maintenance experience
+        setIsDonationModalOpen(false);
+        navigateTo('donate');
+        return;
+      }
+
+      // 3. Normal flow: Donate is online
+      setIsDonationModalOpen(true);
+    },
+    [getMaintenanceForView, navigateTo]
+  );
 
   const closeDonationModal = useCallback(() => {
     setIsDonationModalOpen(false);
-  }, []);
-
-  const updateLocalSettings = useCallback((updates: Partial<SiteSettings>) => {
-    setSettings((prev) => ({ ...prev, ...updates }));
   }, []);
 
   return (
@@ -197,6 +285,7 @@ export function SiteProvider({ children }: { children: React.ReactNode }) {
         programs,
         stories,
         ambassadors,
+        maintenanceSettings,
         loading,
         language,
         setLanguage,
@@ -212,6 +301,8 @@ export function SiteProvider({ children }: { children: React.ReactNode }) {
         refreshStories: refetchAll,
         refreshPrograms: refetchAll,
         updateLocalSettings,
+        getMaintenanceForView,
+        isPageUnderMaintenance,
       }}
     >
       {children}

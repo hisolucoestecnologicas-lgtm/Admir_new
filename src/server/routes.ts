@@ -9,6 +9,7 @@ import { PrivateDocumentStorage } from './privateStorage';
 import { GranularPermissions, User } from '../types';
 import { defaultAIProvider } from './aiProvider';
 import { communicationChannels } from './communicationChannels';
+import { syncService } from './syncService';
 import {
   savePrivateDocumentToFirestore,
   getPrivateDocumentFromFirestore,
@@ -119,6 +120,16 @@ apiRouter.get('/health', (req, res) => {
 // Site Settings
 apiRouter.get('/settings', (req, res) => {
   res.json(db.getSettings());
+});
+
+// Public Maintenance Status
+apiRouter.get('/maintenance/status', (req, res) => {
+  const current = db.getMaintenanceSettings();
+  res.json({
+    global: current.global,
+    pages: current.pages,
+    updatedAt: current.updatedAt,
+  });
 });
 
 // Public Programs
@@ -253,6 +264,11 @@ apiRouter.post('/ambassador-onboarding/:token/upload', async (req, res) => {
 
 // Public Donations submission
 apiRouter.post('/donations/submit', (req, res) => {
+  const m = db.getMaintenanceSettings();
+  if (m.global?.enabled || m.pages?.donate?.enabled) {
+    return res.status(503).json({ error: 'Área de doações temporariamente em manutenção.' });
+  }
+
   const { donorName, donorEmail, donationType, amount, currency, cause, message } = req.body;
   if (!donorName || !donorEmail || !amount) {
     return res.status(400).json({ error: 'Nome, e-mail e valor da doação são obrigatórios.' });
@@ -643,6 +659,58 @@ apiRouter.post('/auth/logout', requireAuth, (req: AuthenticatedRequest, res) => 
 apiRouter.put('/settings', requirePermission('home.edit_texts'), (req: AuthenticatedRequest, res) => {
   try {
     const updated = db.updateSettings(req.body, req.user!, getReqMeta(req));
+    res.json(updated);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Central de Manutenção (Protected CMS Endpoints)
+apiRouter.get('/admin/maintenance', requirePermission('maintenance.view'), (req: AuthenticatedRequest, res) => {
+  try {
+    res.json(db.getMaintenanceSettings());
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.put('/admin/maintenance', requirePermission('maintenance.edit'), (req: AuthenticatedRequest, res) => {
+  try {
+    const updated = db.updateMaintenanceSettings(req.body, req.user!, getReqMeta(req));
+    res.json(updated);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/admin/maintenance/global', requirePermission('maintenance.toggle'), (req: AuthenticatedRequest, res) => {
+  try {
+    const { enabled } = req.body;
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'O parâmetro enabled (boolean) é obrigatório.' });
+    }
+    const updated = db.toggleGlobalMaintenance(enabled, req.user!, getReqMeta(req));
+    res.json(updated);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/admin/maintenance/page/:pageKey', requirePermission('maintenance.toggle'), (req: AuthenticatedRequest, res) => {
+  try {
+    const { pageKey } = req.params;
+    const { enabled, config } = req.body;
+
+    if (config && typeof config === 'object') {
+      const updated = db.updatePageMaintenance(pageKey, { ...config, ...(typeof enabled === 'boolean' ? { enabled } : {}) }, req.user!, getReqMeta(req));
+      return res.json(updated);
+    }
+
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'O parâmetro enabled (boolean) ou config é obrigatório.' });
+    }
+
+    const updated = db.togglePageMaintenance(pageKey, enabled, req.user!, getReqMeta(req));
     res.json(updated);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -1306,6 +1374,11 @@ apiRouter.get('/donations/export/csv', requirePermission('donations.export'), (r
 // Donation Checkout (Stripe & PayPal)
 apiRouter.post('/donations/checkout', async (req: Request, res: Response) => {
   try {
+    const m = db.getMaintenanceSettings();
+    if (m.global?.enabled || m.pages?.donate?.enabled) {
+      return res.status(503).json({ error: 'Área de doações temporariamente em manutenção.' });
+    }
+
     const { amount, currency = 'USD', donationType = 'one-time', donorName, donorEmail, cause = 'General Humanitarian Fund', anonymous = false, publicConsent = false, provider = 'stripe' } = req.body;
 
     const numAmount = parseFloat(amount);
@@ -1585,9 +1658,33 @@ apiRouter.post('/tasks/workflows/:workflowId/stages/reorder', requirePermission(
 });
 
 // Tasks Kanban - Tasks
+apiRouter.get('/tasks/eligible-users', requirePermission('tasks.view'), (req, res) => {
+  const { workspaceId, workflowId, search } = req.query as Record<string, string>;
+  res.json(db.getEligibleTaskUsers(workspaceId, workflowId, search));
+});
+
+apiRouter.get('/tasks/dependencies/all', requirePermission('tasks.view'), (req: AuthenticatedRequest, res) => {
+  try {
+    const dependencies = db.getTaskDependencies();
+    const tasks = db.getTasks();
+    const blockedTaskIds = tasks.filter(t => db.isTaskBlocked(t.id).isBlocked).map(t => t.id);
+    res.json({ dependencies, blockedTaskIds });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 apiRouter.get('/tasks', requirePermission('tasks.view'), (req, res) => {
   const { workspaceId, workflowId } = req.query as Record<string, string>;
   res.json(db.getTasks(workspaceId, workflowId));
+});
+
+apiRouter.get('/tasks/:id', requirePermission('tasks.view'), (req, res) => {
+  const task = db.getTaskById(req.params.id);
+  if (!task) {
+    return res.status(404).json({ error: 'Tarefa não encontrada.' });
+  }
+  res.json(task);
 });
 
 apiRouter.post('/tasks', requirePermission('tasks.create'), (req: AuthenticatedRequest, res) => {
@@ -1738,17 +1835,6 @@ apiRouter.delete('/tasks/:id/attachments/:attachmentId', requirePermission('task
 });
 
 // Task Dependencies
-apiRouter.get('/tasks/dependencies/all', requirePermission('tasks.view'), (req: AuthenticatedRequest, res) => {
-  try {
-    const dependencies = db.getTaskDependencies();
-    const tasks = db.getTasks();
-    const blockedTaskIds = tasks.filter(t => db.isTaskBlocked(t.id).isBlocked).map(t => t.id);
-    res.json({ dependencies, blockedTaskIds });
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
 apiRouter.get('/tasks/:id/dependencies', requirePermission('tasks.view'), (req: AuthenticatedRequest, res) => {
   try {
     const dependencies = db.getTaskDependencies(req.params.id);
@@ -1787,81 +1873,6 @@ apiRouter.delete('/tasks/:id/dependencies/:depId', requirePermission('tasks.edit
     res.json({ success: true });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
-  }
-});
-
-// Donations Checkout Session (Stripe)
-apiRouter.post('/donations/create-checkout-session', async (req, res) => {
-  try {
-    const { amount, frequency, donorName, donorEmail, currency } = req.body;
-
-    // Server-side validation
-    const numAmount = Number(amount);
-    if (!numAmount || isNaN(numAmount) || !isFinite(numAmount) || numAmount <= 0) {
-      return res.status(400).json({ error: 'Valor da doação inválido.' });
-    }
-
-    const validCurrency = (currency || 'USD').toUpperCase();
-    if (validCurrency !== 'USD') {
-      return res.status(400).json({ error: 'Moeda não suportada atualmente.' });
-    }
-
-    const validFrequency = frequency === 'monthly' ? 'monthly' : 'one-time';
-
-    if (!donorEmail || typeof donorEmail !== 'string' || !donorEmail.includes('@') || donorEmail.length > 254) {
-      return res.status(400).json({ error: 'E-mail do doador inválido.' });
-    }
-
-    if (donorName && (typeof donorName !== 'string' || donorName.length > 150)) {
-      return res.status(400).json({ error: 'Nome do doador inválido.' });
-    }
-
-    const stripe = getStripeClient();
-    if (!stripe || !isStripeConfigured()) {
-      return res.status(503).json({ error: 'Payment service is temporarily unavailable.' });
-    }
-
-    // Convert amount to cents for USD
-    const unitAmount = Math.round(numAmount * 100);
-    if (unitAmount < 50) { // minimum 50 cents USD for Stripe
-      return res.status(400).json({ error: 'O valor mínimo para doação é de $0.50 USD.' });
-    }
-
-    const protocol = req.protocol;
-    const host = req.get('host') || 'localhost:3000';
-    const baseUrl = `${protocol}://${host}`;
-
-    const sessionParams: Stripe.Checkout.SessionCreateParams = {
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price_data: {
-            currency: validCurrency.toLowerCase(),
-            product_data: {
-              name: validFrequency === 'monthly' ? 'ADMIR Monthly Donation' : 'ADMIR Donation',
-              description: `Donation by ${donorName || 'Supporter'} (${donorEmail})`,
-            },
-            unit_amount: unitAmount,
-            ...(validFrequency === 'monthly' ? { recurring: { interval: 'month' } } : {}),
-          },
-          quantity: 1,
-        },
-      ],
-      mode: validFrequency === 'monthly' ? 'subscription' : 'payment',
-      success_url: `${baseUrl}/donate?success=true&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${baseUrl}/donate?canceled=true`,
-      customer_email: donorEmail,
-      metadata: {
-        donorName: donorName || 'Supporter',
-        frequency: validFrequency,
-      },
-    };
-
-    const session = await stripe.checkout.sessions.create(sessionParams);
-
-    return res.json({ url: session.url, sessionId: session.id });
-  } catch (err: any) {
-    return res.status(500).json({ error: 'Erro ao processar sessão de pagamento.' });
   }
 });
 
@@ -1952,3 +1963,113 @@ apiRouter.get('/history/export', requirePermission('history.export'), (req, res)
   res.setHeader('Content-Disposition', 'attachment; filename="admir-audit-log.csv"');
   res.send(csv);
 });
+
+/* =========================================================================
+   SYNCHRONIZATION (PRODUÇÃO → DEV / HOMOLOGAÇÃO) ENDPOINTS
+   ========================================================================= */
+
+// Get status & available modules
+apiRouter.get('/sync/status', requirePermission('sync.view'), (req: AuthenticatedRequest, res) => {
+  try {
+    const status = syncService.getStatus();
+    res.json(status);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Test connection to Production source (READ-ONLY)
+apiRouter.post('/sync/test-connection', requirePermission('sync.view'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const result = await syncService.testConnection();
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// READ-ONLY export of current data (used when this instance is queried as source)
+apiRouter.get('/sync/export-source', (req: Request, res) => {
+  const syncToken = process.env.PROD_SYNC_TOKEN || process.env.ADMIR_PROD_SYNC_TOKEN;
+  const authHeader = req.headers['authorization'];
+  const tokenHeader = req.headers['x-sync-token'];
+
+  // Check token if configured
+  if (syncToken) {
+    const provided = tokenHeader || (authHeader?.startsWith('Bearer ') ? authHeader.replace('Bearer ', '').trim() : null);
+    if (provided !== syncToken) {
+      return res.status(401).json({ error: 'Token de sincronização inválido ou ausente.' });
+    }
+  }
+
+  try {
+    const data = syncService.exportSourceData();
+    res.json(data);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Dry Run / Preview Analysis
+apiRouter.post('/sync/preview', requirePermission('sync.preview'), async (req: AuthenticatedRequest, res) => {
+  const { selectedModules, isFullBase, snapshotData } = req.body;
+  try {
+    const preview = await syncService.analyzePreview(selectedModules || [], Boolean(isFullBase), snapshotData);
+    res.json(preview);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Execute Sync (Produção → Dev) with automatic target backup
+apiRouter.post('/sync/execute', requirePermission('sync.execute'), async (req: AuthenticatedRequest, res) => {
+  const { selectedModules, strategy, snapshotData } = req.body;
+
+  if (!selectedModules || !Array.isArray(selectedModules) || selectedModules.length === 0) {
+    return res.status(400).json({ error: 'Selecione ao menos um módulo para sincronização.' });
+  }
+
+  try {
+    const result = await syncService.executeSync(
+      selectedModules,
+      strategy || 'source_wins',
+      req.user!,
+      getReqMeta(req),
+      snapshotData
+    );
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get available backups
+apiRouter.get('/sync/backups', requirePermission('sync.view'), (req: AuthenticatedRequest, res) => {
+  try {
+    const backups = syncService.getBackups();
+    res.json(backups);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Restore a target backup snapshot
+apiRouter.post('/sync/restore/:backupId', requirePermission('sync.restore'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const result = await syncService.restoreBackup(req.params.backupId, req.user!, getReqMeta(req));
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get sync execution history
+apiRouter.get('/sync/history', requirePermission('sync.view'), (req: AuthenticatedRequest, res) => {
+  try {
+    const history = syncService.getHistory();
+    res.json(history);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+

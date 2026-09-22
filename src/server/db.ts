@@ -1,3 +1,4 @@
+import { performance } from 'perf_hooks';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -11,6 +12,7 @@ import {
   Donation,
   PaymentEvent,
   Task,
+  TaskParticipant,
   TaskComment,
   TaskChecklistItem,
   TaskAttachment,
@@ -29,6 +31,8 @@ import {
   AssistantChatFeedback,
   GranularPermissions,
   UserRole,
+  MaintenanceSettings,
+  MaintenanceConfig,
 } from '../types';
 import {
   INITIAL_SITE_SETTINGS,
@@ -42,6 +46,7 @@ import {
   INITIAL_ADDITIONAL_USERS,
   INITIAL_INVITES,
   INITIAL_AUDIT_LOGS,
+  INITIAL_MAINTENANCE_SETTINGS,
 } from '../data/initialData';
 import { getPresetPermissions } from '../data/permissionPresets';
 
@@ -54,6 +59,7 @@ interface DatabaseSchema {
   donations: Donation[];
   paymentEvents: PaymentEvent[];
   tasks: Task[];
+  taskTicketCounter?: number;
   taskWorkspaces: TaskWorkspace[];
   taskWorkflows: TaskWorkflow[];
   taskWorkflowStages: TaskWorkflowStage[];
@@ -67,6 +73,7 @@ interface DatabaseSchema {
   assistantFaqs?: AssistantFaqItem[];
   contactRequests?: ContactRequest[];
   assistantFeedbacks?: AssistantChatFeedback[];
+  maintenanceSettings?: MaintenanceSettings;
 }
 
 export interface RequestMetadata {
@@ -81,10 +88,15 @@ class DatabaseService {
   private data: DatabaseSchema;
 
   constructor() {
+    (global as any).__startup_timers = (global as any).__startup_timers || {};
+    (global as any).__startup_timers.dbInitStart = performance.now();
     this.data = this.loadDatabase();
+    (global as any).__startup_timers.dbInitEnd = performance.now();
   }
 
   private loadDatabase(): DatabaseSchema {
+    (global as any).__startup_timers = (global as any).__startup_timers || {};
+    (global as any).__startup_timers.loadDatabaseStart = performance.now();
     try {
       if (!fs.existsSync(DB_DIR)) {
         fs.mkdirSync(DB_DIR, { recursive: true });
@@ -99,6 +111,14 @@ class DatabaseService {
           if (!parsed.taskWorkflows) parsed.taskWorkflows = [];
           if (!parsed.taskWorkflowStages) parsed.taskWorkflowStages = [];
           if (!parsed.taskDependencies) parsed.taskDependencies = [];
+          if (parsed.taskTicketCounter === undefined) {
+            const seqs = (parsed.tasks || []).map((t: any) => {
+              if (!t.ticketNumber) return 0;
+              const m = String(t.ticketNumber).match(/^ADMIR-(\d+)$/i);
+              return m ? parseInt(m[1], 10) : 0;
+            });
+            parsed.taskTicketCounter = Math.max(0, ...seqs);
+          }
           if (!parsed.assistantSettings) {
             parsed.assistantSettings = {
               enabled: true,
@@ -167,12 +187,16 @@ class DatabaseService {
           }
           if (!parsed.contactRequests) parsed.contactRequests = [];
           if (!parsed.assistantFeedbacks) parsed.assistantFeedbacks = [];
+          if (!parsed.maintenanceSettings) {
+            parsed.maintenanceSettings = JSON.parse(JSON.stringify(INITIAL_MAINTENANCE_SETTINGS));
+          }
 
           const changedAccounts = this.reconcileOfficialAccounts(parsed);
           const changedTasks = this.migrateLegacyTasks(parsed);
           if (changedAccounts || changedTasks) {
             this.save(parsed);
           }
+          (global as any).__startup_timers.loadDatabaseEnd = performance.now();
           return parsed;
         }
       }
@@ -228,10 +252,12 @@ class DatabaseService {
           status: 'new',
         },
       ],
+      maintenanceSettings: JSON.parse(JSON.stringify(INITIAL_MAINTENANCE_SETTINGS)),
     };
 
     this.reconcileOfficialAccounts(defaultDb);
     this.save(defaultDb);
+    (global as any).__startup_timers.loadDatabaseEnd = performance.now();
     return defaultDb;
   }
 
@@ -1533,6 +1559,62 @@ class DatabaseService {
     return tasks.sort((a, b) => a.orderIndex - b.orderIndex);
   }
 
+  public getTaskById(id: string): Task | undefined {
+    return this.data.tasks.find(t => t.id === id);
+  }
+
+  private getNextTaskTicketNumber(): string {
+    const existingSeqNumbers = (this.data.tasks || [])
+      .map(t => {
+        if (!t.ticketNumber) return 0;
+        const match = String(t.ticketNumber).match(/^ADMIR-(\d+)$/i);
+        return match ? parseInt(match[1], 10) : 0;
+      });
+    const maxSeq = Math.max(0, ...existingSeqNumbers);
+    const nextSeq = Math.max(maxSeq + 1, (this.data.taskTicketCounter || 0) + 1);
+    this.data.taskTicketCounter = nextSeq;
+    return `ADMIR-${String(nextSeq).padStart(6, '0')}`;
+  }
+
+  public getEligibleTaskUsers(workspaceId?: string, workflowId?: string, search?: string): Array<{
+    id: string;
+    name: string;
+    email: string;
+    role: string;
+    title?: string;
+    avatar?: string;
+  }> {
+    let users = (this.data.users || []).filter(u => u.status === 'active');
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      users = users.filter(u =>
+        (u.name && u.name.toLowerCase().includes(q)) ||
+        (u.email && u.email.toLowerCase().includes(q)) ||
+        (u.title && u.title.toLowerCase().includes(q))
+      );
+    }
+    return users.map(u => ({
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      role: u.role,
+      title: u.title,
+      avatarUrl: u.avatarUrl,
+      avatar: u.avatarUrl,
+    }));
+  }
+
+  private validateTaskUserEligibility(userId: string): User {
+    const u = this.data.users.find(usr => usr.id === userId);
+    if (!u) {
+      throw new Error(`Usuário informado não foi encontrado no sistema.`);
+    }
+    if (u.status !== 'active') {
+      throw new Error(`Usuário "${u.name}" está inativo e não pode ser atribuído a tarefas.`);
+    }
+    return u;
+  }
+
   public createTask(data: Omit<Task, 'id' | 'comments' | 'createdAt' | 'updatedAt'>, user: User, meta?: RequestMetadata): Task {
     // Validate hierarchy
     const stage = this.data.taskWorkflowStages.find(s => s.id === data.stageId);
@@ -1542,10 +1624,60 @@ class DatabaseService {
     const workspace = this.data.taskWorkspaces.find(ws => ws.id === data.workspaceId);
     if (!workspace || workflow.workspaceId !== workspace.id) throw new Error('Workflow does not belong to the workspace');
 
+    // Generate unique, sequential, immutable ticket number
+    const ticketNumber = this.getNextTaskTicketNumber();
+
+    // Validate responsible user if responsibleId is provided
+    let responsibleName = (data.responsible || '').trim();
+    let responsibleId = data.responsibleId;
+    let responsibleEmail = data.responsibleEmail;
+
+    if (responsibleId) {
+      const respUser = this.validateTaskUserEligibility(responsibleId);
+      responsibleName = respUser.name;
+      responsibleEmail = respUser.email;
+    } else if (responsibleName) {
+      const matched = this.data.users.find(u =>
+        u.status === 'active' &&
+        (u.name.toLowerCase() === responsibleName.toLowerCase() || u.email.toLowerCase() === responsibleName.toLowerCase())
+      );
+      if (matched) {
+        responsibleId = matched.id;
+        responsibleName = matched.name;
+        responsibleEmail = matched.email;
+      }
+    }
+
+    // Validate participants if provided
+    let participantIds: string[] = [];
+    let participants: TaskParticipant[] = [];
+    if (data.participantIds && Array.isArray(data.participantIds)) {
+      const uniqueIds = Array.from(new Set(data.participantIds.filter(Boolean)));
+      for (const pId of uniqueIds) {
+        const pUser = this.validateTaskUserEligibility(pId);
+        participantIds.push(pUser.id);
+        participants.push({
+          id: pUser.id,
+          name: pUser.name,
+          email: pUser.email,
+          role: pUser.role,
+          title: pUser.title,
+          avatarUrl: pUser.avatarUrl,
+          avatar: pUser.avatarUrl,
+        });
+      }
+    }
+
     const id = `task-${Date.now()}`;
     const newTask: Task = {
       ...data,
       id,
+      ticketNumber,
+      responsible: responsibleName,
+      responsibleId,
+      responsibleEmail,
+      participantIds,
+      participants,
       checklist: [],
       comments: [],
       createdAt: new Date().toISOString(),
@@ -1555,7 +1687,7 @@ class DatabaseService {
     this.data.tasks.push(newTask);
     this.save();
 
-    this.recordAuditLog(user, 'Criação', 'Tasks', newTask.title, `Tarefa "${newTask.title}" adicionada`, meta);
+    this.recordAuditLog(user, 'Criação', 'Tasks', newTask.title, `Tarefa "${newTask.title}" [${ticketNumber}] adicionada`, meta);
     return newTask;
   }
 
@@ -1564,9 +1696,70 @@ class DatabaseService {
     if (idx === -1) throw new Error('Task not found');
 
     const prev = { ...this.data.tasks[idx] };
+
+    // Validate responsible if responsibleId or responsible text is updated
+    let updatedResponsible = updates.responsible !== undefined ? updates.responsible : prev.responsible;
+    let updatedResponsibleId = updates.responsibleId !== undefined ? updates.responsibleId : prev.responsibleId;
+    let updatedResponsibleEmail = updates.responsibleEmail !== undefined ? updates.responsibleEmail : prev.responsibleEmail;
+
+    if (updates.responsibleId !== undefined) {
+      if (updates.responsibleId) {
+        const respUser = this.validateTaskUserEligibility(updates.responsibleId);
+        updatedResponsible = respUser.name;
+        updatedResponsibleId = respUser.id;
+        updatedResponsibleEmail = respUser.email;
+      } else {
+        updatedResponsibleId = undefined;
+        updatedResponsibleEmail = undefined;
+        if (updates.responsible === undefined) {
+          updatedResponsible = '';
+        }
+      }
+    } else if (updates.responsible !== undefined && updates.responsible.trim()) {
+      const matched = this.data.users.find(u =>
+        u.status === 'active' &&
+        (u.name.toLowerCase() === updates.responsible!.trim().toLowerCase() || u.email.toLowerCase() === updates.responsible!.trim().toLowerCase())
+      );
+      if (matched) {
+        updatedResponsibleId = matched.id;
+        updatedResponsible = matched.name;
+        updatedResponsibleEmail = matched.email;
+      }
+    }
+
+    // Validate participants if participantIds is updated
+    let updatedParticipantIds = prev.participantIds || [];
+    let updatedParticipants = prev.participants || [];
+
+    if (updates.participantIds !== undefined) {
+      const uniqueIds = Array.from(new Set((updates.participantIds || []).filter(Boolean)));
+      updatedParticipantIds = [];
+      updatedParticipants = [];
+      for (const pId of uniqueIds) {
+        const pUser = this.validateTaskUserEligibility(pId);
+        updatedParticipantIds.push(pUser.id);
+        updatedParticipants.push({
+          id: pUser.id,
+          name: pUser.name,
+          email: pUser.email,
+          role: pUser.role,
+          title: pUser.title,
+          avatarUrl: pUser.avatarUrl,
+          avatar: pUser.avatarUrl,
+        });
+      }
+    }
+
     const updated: Task = {
       ...prev,
       ...updates,
+      responsible: updatedResponsible,
+      responsibleId: updatedResponsibleId,
+      responsibleEmail: updatedResponsibleEmail,
+      participantIds: updatedParticipantIds,
+      participants: updatedParticipants,
+      // Ensure ticketNumber is strictly immutable once assigned
+      ticketNumber: prev.ticketNumber || updates.ticketNumber,
       updatedAt: new Date().toISOString(),
     };
 
@@ -1592,14 +1785,15 @@ class DatabaseService {
     this.save();
 
     const isStageChange = updates.stageId && updates.stageId !== prev.stageId;
+    const ticketDisplay = updated.ticketNumber ? `[${updated.ticketNumber}] ` : '';
     this.recordAuditLog(
       user,
       'Alteração',
       'Tasks',
       updated.title,
       isStageChange
-        ? `Tarefa movida de stage "${prev.stageId}" para "${updated.stageId}"`
-        : `Tarefa atualizada: ${updated.title}`,
+        ? `Tarefa ${ticketDisplay}movida de stage "${prev.stageId}" para "${updated.stageId}"`
+        : `Tarefa ${ticketDisplay}atualizada: ${updated.title}`,
       meta
     );
 
@@ -2833,6 +3027,165 @@ Endereço Sede: ${settings.footerAddress || 'Washington, D.C. - Estados Unidos'}
     }
 
     return parts.join('\n\n');
+  }
+
+  // --- CENTRAL DE MANUTENÇÃO ---
+  public getMaintenanceSettings(): MaintenanceSettings {
+    if (!this.data.maintenanceSettings) {
+      this.data.maintenanceSettings = JSON.parse(JSON.stringify(INITIAL_MAINTENANCE_SETTINGS));
+      this.save();
+    }
+    return JSON.parse(JSON.stringify(this.data.maintenanceSettings));
+  }
+
+  public updateMaintenanceSettings(
+    newSettings: Partial<MaintenanceSettings>,
+    user: User,
+    meta?: RequestMetadata
+  ): MaintenanceSettings {
+    const current = this.getMaintenanceSettings();
+    const prevStr = JSON.stringify(current);
+
+    const merged: MaintenanceSettings = {
+      global: {
+        ...current.global,
+        ...(newSettings.global || {}),
+      },
+      pages: {
+        ...current.pages,
+        ...(newSettings.pages || {}),
+      },
+      updatedAt: new Date().toISOString(),
+      updatedBy: user.name || user.email,
+    };
+
+    this.data.maintenanceSettings = merged;
+    this.save();
+
+    this.recordAuditLog(
+      user,
+      'Alteração',
+      'Home',
+      'Central de Manutenção',
+      `Configurações da Central de Manutenção atualizadas por ${user.name || user.email}.`,
+      meta,
+      prevStr.substring(0, 300) + '...',
+      JSON.stringify(merged).substring(0, 300) + '...'
+    );
+
+    return JSON.parse(JSON.stringify(this.data.maintenanceSettings));
+  }
+
+  public toggleGlobalMaintenance(
+    enabled: boolean,
+    user: User,
+    meta?: RequestMetadata
+  ): MaintenanceSettings {
+    const current = this.getMaintenanceSettings();
+    current.global.enabled = enabled;
+    current.updatedAt = new Date().toISOString();
+    current.updatedBy = user.name || user.email;
+
+    this.data.maintenanceSettings = current;
+    this.save();
+
+    const actionText = enabled ? 'ativado' : 'desativado';
+    this.recordAuditLog(
+      user,
+      'Alteração',
+      'Home',
+      'Central de Manutenção - Global',
+      `Modo de manutenção global ${actionText} por ${user.name || user.email}.`,
+      meta
+    );
+
+    return JSON.parse(JSON.stringify(this.data.maintenanceSettings));
+  }
+
+  public togglePageMaintenance(
+    pageKey: string,
+    enabled: boolean,
+    user: User,
+    meta?: RequestMetadata
+  ): MaintenanceSettings {
+    const current = this.getMaintenanceSettings();
+    if (!current.pages[pageKey]) {
+      current.pages[pageKey] = {
+        enabled: false,
+        themeId: 'theme-01',
+        title: `Página ${pageKey} em Manutenção`,
+        message: '<p>Esta área está passando por manutenção programada.</p>',
+        showLogo: true,
+        showButton: true,
+        buttonLabel: 'Voltar ao Início',
+        buttonUrl: '/#home',
+        showContact: true,
+        showEstimatedReturn: false,
+        showCountdown: false,
+      };
+    }
+
+    current.pages[pageKey].enabled = enabled;
+    current.updatedAt = new Date().toISOString();
+    current.updatedBy = user.name || user.email;
+
+    this.data.maintenanceSettings = current;
+    this.save();
+
+    const actionText = enabled ? 'ativada' : 'desativada';
+    this.recordAuditLog(
+      user,
+      'Alteração',
+      'Home',
+      `Central de Manutenção - Página ${pageKey}`,
+      `Manutenção na página "${pageKey}" ${actionText} por ${user.name || user.email}.`,
+      meta
+    );
+
+    return JSON.parse(JSON.stringify(this.data.maintenanceSettings));
+  }
+
+  public updatePageMaintenance(
+    pageKey: string,
+    config: Partial<MaintenanceConfig>,
+    user: User,
+    meta?: RequestMetadata
+  ): MaintenanceSettings {
+    const current = this.getMaintenanceSettings();
+    const existing = current.pages[pageKey] || {
+      enabled: false,
+      themeId: 'theme-01',
+      title: `Página ${pageKey} em Manutenção`,
+      message: '<p>Esta área está passando por manutenção programada.</p>',
+      showLogo: true,
+      showButton: true,
+      buttonLabel: 'Voltar ao Início',
+      buttonUrl: '/#home',
+      showContact: true,
+      showEstimatedReturn: false,
+      showCountdown: false,
+    };
+
+    current.pages[pageKey] = {
+      ...existing,
+      ...config,
+    };
+    current.updatedAt = new Date().toISOString();
+    current.updatedBy = user.name || user.email;
+
+    this.data.maintenanceSettings = current;
+    this.save();
+
+    this.recordAuditLog(
+      user,
+      'Alteração',
+      'Home',
+      `Central de Manutenção - Página ${pageKey}`,
+      `Configurações da página "${pageKey}" atualizadas na Central de Manutenção.`,
+      meta
+    );
+
+    return JSON.parse(JSON.stringify(this.data.maintenanceSettings));
   }
 }
 

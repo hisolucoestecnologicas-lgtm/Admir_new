@@ -2,15 +2,74 @@
   "entities": {
     "admins": {
       "title": "Admins",
-      "description": "Administrative users and credentials",
-      "fields": {
-        "email": { "type": "string" },
-        "name": { "type": "string" },
-        "role": { "type": "string" },
-        "authProvider": { "type": "string" },
-        "firebaseUid": { "type": "string" },
-        "status": { "type": "string" }
-      }
+      "description": "Administrative users and credentials record",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "description": "Official admin email address"
+        },
+        "name": {
+          "type": "string",
+          "description": "Admin full name"
+        },
+        "role": {
+          "type": "string",
+          "description": "Admin RBAC role: owner, admin, or editor"
+        },
+        "authProvider": {
+          "type": "string",
+          "description": "Authentication provider"
+        },
+        "firebaseUid": {
+          "type": "string",
+          "description": "Firebase Auth UID"
+        },
+        "status": {
+          "type": "string",
+          "description": "Active or suspended status"
+        }
+      },
+      "required": ["email", "role", "status"]
+    },
+    "private_documents": {
+      "title": "Private Documents",
+      "description": "Private diplomat and candidate documents chunks",
+      "type": "object",
+      "properties": {
+        "ambassadorId": {
+          "type": "string",
+          "description": "Unique identifier of the ambassador or candidate"
+        },
+        "documentId": {
+          "type": "string",
+          "description": "Unique document identifier"
+        },
+        "chunkIndex": {
+          "type": "number",
+          "description": "Zero-indexed chunk position"
+        },
+        "totalChunks": {
+          "type": "number",
+          "description": "Total number of chunks in the document"
+        },
+        "data": {
+          "type": "string",
+          "description": "Base64 encoded data segment"
+        }
+      },
+      "required": ["ambassadorId", "documentId"]
+    }
+  },
+  "firestore": {
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/admins" },
+      "description": "Registered administrative profiles and permissions"
+    },
+    "/private_documents/{docId}": {
+      "schema": { "$ref": "#/entities/private_documents" },
+      "description": "Encrypted or encoded private document storage partitions"
     }
   }
 }
+

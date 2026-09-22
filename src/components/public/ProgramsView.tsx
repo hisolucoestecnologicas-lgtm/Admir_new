@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ArrowRight, Heart, Sparkles, Filter, CheckCircle2 } from 'lucide-react';
+import { ArrowRight, Heart, Sparkles, Filter, CheckCircle2, Map, LayoutGrid, Layers } from 'lucide-react';
 import { useSite } from '../../context/SiteContext';
 import { useTranslation } from '../../i18n/useTranslation';
 import {
@@ -8,11 +8,13 @@ import {
   getProgramShortDesc,
   getProgramObjectives,
 } from '../../lib/i18nHelper';
+import { ProgramsMap } from './ProgramsMap';
 
 export function ProgramsView() {
   const { programs, navigateTo, openDonationModal, language } = useSite();
   const { t } = useTranslation();
   const [selectedCategory, setSelectedCategory] = useState<string>('All');
+  const [displayMode, setDisplayMode] = useState<'both' | 'map' | 'grid'>('both');
 
   const categories = [
     { key: 'All', label: t('programs.filterAll') },
@@ -63,33 +65,108 @@ export function ProgramsView() {
         </div>
       </section>
 
-      {/* Category Filter Bar */}
+      {/* Category Filter & View Mode Bar */}
       <div className="sticky top-20 z-30 bg-white border-b border-slate-200 shadow-sm">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex overflow-x-auto gap-2 py-3 items-center">
-          <span className="text-xs font-bold text-slate-500 uppercase mr-2 flex items-center gap-1 shrink-0">
-            <Filter className="w-3.5 h-3.5" /> {language === 'pt' ? 'Setor:' : language === 'es' ? 'Sector:' : 'Sector:'}
-          </span>
-          {categories.map((cat) => (
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center justify-between gap-4 py-2.5">
+          <div className="flex overflow-x-auto gap-2 items-center flex-1">
+            <span className="text-xs font-bold text-slate-500 uppercase mr-2 flex items-center gap-1 shrink-0">
+              <Filter className="w-3.5 h-3.5" /> {language === 'pt' ? 'Setor:' : language === 'es' ? 'Sector:' : 'Sector:'}
+            </span>
+            {categories.map((cat) => (
+              <button
+                key={cat.key}
+                type="button"
+                onClick={() => setSelectedCategory(cat.key)}
+                className={`px-3.5 py-1.5 text-xs font-bold rounded-xl whitespace-nowrap transition-colors cursor-pointer ${
+                  selectedCategory === cat.key
+                    ? 'bg-amber-600 text-white shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                }`}
+              >
+                {cat.label}
+              </button>
+            ))}
+          </div>
+
+          {/* View Mode Toggle Buttons */}
+          <div className="hidden sm:flex items-center gap-1 bg-slate-100 p-1 rounded-xl shrink-0">
             <button
-              key={cat.key}
+              id="programs-view-both"
               type="button"
-              onClick={() => setSelectedCategory(cat.key)}
-              className={`px-4 py-2 text-xs font-bold rounded-xl whitespace-nowrap transition-colors cursor-pointer ${
-                selectedCategory === cat.key
-                  ? 'bg-amber-600 text-white shadow-sm'
-                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+              onClick={() => setDisplayMode('both')}
+              className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                displayMode === 'both'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
               }`}
+              title={language === 'pt' ? 'Mapa e Programas' : language === 'es' ? 'Mapa y Programas' : 'Map & Programs'}
             >
-              {cat.label}
+              <Layers className="w-3.5 h-3.5 text-amber-600" />
+              <span>{language === 'pt' ? 'Geral' : language === 'es' ? 'General' : 'Overview'}</span>
             </button>
-          ))}
+            <button
+              id="programs-view-map"
+              type="button"
+              onClick={() => setDisplayMode('map')}
+              className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                displayMode === 'map'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+              title={language === 'pt' ? 'Apenas Mapa' : language === 'es' ? 'Solo Mapa' : 'Map Only'}
+            >
+              <Map className="w-3.5 h-3.5 text-sky-600" />
+              <span>{language === 'pt' ? 'Mapa' : language === 'es' ? 'Mapa' : 'Map'}</span>
+            </button>
+            <button
+              id="programs-view-grid"
+              type="button"
+              onClick={() => setDisplayMode('grid')}
+              className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                displayMode === 'grid'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+              title={language === 'pt' ? 'Apenas Lista' : language === 'es' ? 'Solo Lista' : 'List Only'}
+            >
+              <LayoutGrid className="w-3.5 h-3.5 text-slate-600" />
+              <span>{language === 'pt' ? 'Cartões' : language === 'es' ? 'Tarjetas' : 'Cards'}</span>
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* Programs Grid */}
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16">
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-          {filteredPrograms.map((prog) => {
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-12">
+        {/* Interactive Humanitarian Projects Map Component */}
+        {displayMode !== 'grid' && (
+          <ProgramsMap
+            selectedCategory={selectedCategory}
+            onSelectCategory={(cat) => setSelectedCategory(cat)}
+          />
+        )}
+
+        {/* Section divider when showing both */}
+        {displayMode === 'both' && (
+          <div className="my-10 pt-8 border-t border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div>
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-slate-200 text-slate-700 text-xs font-bold uppercase tracking-wider mb-2">
+                <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+                {t('programs.badge')}
+              </div>
+              <h2 className="text-2xl sm:text-3xl font-black font-serif-heading text-slate-900">
+                {t('programs.title')}
+              </h2>
+            </div>
+            <p className="text-xs text-slate-500 max-w-md">
+              {filteredPrograms.length} {language === 'pt' ? 'programas diplomáticos e humanitários cadastrados' : language === 'es' ? 'programas diplomáticos y humanitarios registrados' : 'diplomatic and humanitarian programs registered'}
+            </p>
+          </div>
+        )}
+
+        {/* Programs Grid */}
+        {displayMode !== 'map' && (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+            {filteredPrograms.map((prog) => {
             const title = getProgramTitle(prog, language);
             const category = getProgramCategory(prog, language);
             const shortDesc = getProgramShortDesc(prog, language);
@@ -162,6 +239,7 @@ export function ProgramsView() {
             );
           })}
         </div>
+        )}
       </div>
     </div>
   );

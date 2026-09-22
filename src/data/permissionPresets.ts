@@ -67,6 +67,15 @@ export const ALL_PERMISSIONS_KEYS: (keyof GranularPermissions)[] = [
   'history.view',
   'history.filter',
   'history.export',
+
+  'maintenance.view',
+  'maintenance.edit',
+  'maintenance.toggle',
+
+  'sync.view',
+  'sync.preview',
+  'sync.execute',
+  'sync.restore',
 ];
 
 export function getPresetPermissions(preset: 'all' | 'none' | 'readonly' | 'editor' | 'manager'): GranularPermissions {
@@ -137,6 +146,15 @@ export function getPresetPermissions(preset: 'all' | 'none' | 'readonly' | 'edit
     'history.view': false,
     'history.filter': false,
     'history.export': false,
+
+    'maintenance.view': false,
+    'maintenance.edit': false,
+    'maintenance.toggle': false,
+
+    'sync.view': false,
+    'sync.preview': false,
+    'sync.execute': false,
+    'sync.restore': false,
   };
 
   if (preset === 'none') return base;
@@ -162,6 +180,7 @@ export function getPresetPermissions(preset: 'all' | 'none' | 'readonly' | 'edit
     base['tasks.view'] = true;
     base['history.view'] = true;
     base['history.filter'] = true;
+    base['maintenance.view'] = true;
     return base;
   }
 
@@ -202,6 +221,9 @@ export function getPresetPermissions(preset: 'all' | 'none' | 'readonly' | 'edit
     base['tasks.complete'] = true;
 
     base['history.view'] = true;
+
+    base['maintenance.view'] = true;
+    base['maintenance.edit'] = true;
     return base;
   }
 
@@ -212,6 +234,9 @@ export function getPresetPermissions(preset: 'all' | 'none' | 'readonly' | 'edit
     // Manager has almost everything except deleting admins or removing owner
     base['admins.remove_access'] = false;
     base['admins.change_permissions'] = false;
+    base['maintenance.view'] = true;
+    base['maintenance.edit'] = true;
+    base['maintenance.toggle'] = true;
     return base;
   }
 
@@ -355,6 +380,27 @@ export const PERMISSION_SECTIONS: PermissionSection[] = [
       { key: 'history.view', label: 'Visualizar histórico / audit log' },
       { key: 'history.filter', label: 'Filtrar por pessoa, tipo e período' },
       { key: 'history.export', label: 'Exportar logs de auditoria' },
+    ],
+  },
+  {
+    id: 'maintenance',
+    name: 'CENTRAL DE MANUTENÇÃO',
+    description: 'Controle de modo de manutenção global e por página, temas e mensagens',
+    permissions: [
+      { key: 'maintenance.view', label: 'Visualizar central de manutenção' },
+      { key: 'maintenance.edit', label: 'Editar temas, títulos e mensagens de manutenção' },
+      { key: 'maintenance.toggle', label: 'Ativar e desativar status de manutenção' },
+    ],
+  },
+  {
+    id: 'sync',
+    name: 'SINCRONIZAÇÃO DE DADOS',
+    description: 'Sincronização controlada de dados de Produção para Desenvolvimento com preview e backup',
+    permissions: [
+      { key: 'sync.view', label: 'Visualizar painel de sincronização' },
+      { key: 'sync.preview', label: 'Executar análise de sincronização (Dry Run)' },
+      { key: 'sync.execute', label: 'Executar sincronização (Produção → Dev)' },
+      { key: 'sync.restore', label: 'Restaurar snapshots de backup anteriores' },
     ],
   },
 ];

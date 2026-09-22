@@ -8,9 +8,11 @@ import { api } from '../../lib/api';
 const PRESET_AMOUNTS = [25, 50, 100, 250, 500];
 
 export function DonationModal() {
-  const { isDonationModalOpen, closeDonationModal, donationPreset, language } = useSite();
+  const { isDonationModalOpen, closeDonationModal, donationPreset, language, getMaintenanceForView } = useSite();
   const { success, error } = useToast();
   const { t } = useTranslation();
+
+  const donateMaintenance = getMaintenanceForView('donate');
 
   const [frequency, setFrequency] = useState<'one-time' | 'monthly'>('one-time');
   const [selectedAmount, setSelectedAmount] = useState<number>(100);
@@ -21,6 +23,12 @@ export function DonationModal() {
   const [message, setMessage] = useState<string>('');
   const [loading, setLoading] = useState(false);
   const [completedTxn, setCompletedTxn] = useState<{ id: string; amount: number; transactionId: string } | null>(null);
+
+  useEffect(() => {
+    if (donateMaintenance.inMaintenance && isDonationModalOpen) {
+      closeDonationModal();
+    }
+  }, [donateMaintenance.inMaintenance, isDonationModalOpen, closeDonationModal]);
 
   useEffect(() => {
     if (donationPreset.amount) {
@@ -35,7 +43,7 @@ export function DonationModal() {
     }
   }, [donationPreset, isDonationModalOpen]);
 
-  if (!isDonationModalOpen) return null;
+  if (!isDonationModalOpen || donateMaintenance.inMaintenance) return null;
 
   const currentAmount = customAmount ? parseFloat(customAmount) || 0 : selectedAmount;
 
