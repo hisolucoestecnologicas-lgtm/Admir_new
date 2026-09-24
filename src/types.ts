@@ -50,7 +50,15 @@ export interface GranularPermissions {
   // Photos / Media
   'media.view': boolean;
   'media.upload': boolean;
+  'media.bulk_upload': boolean;
   'media.edit_metadata': boolean;
+  'media.bulk_edit': boolean;
+  'media.manage_albums': boolean;
+  'media.ai_organize': boolean;
+  'media.ai_review': boolean;
+  'media.review_duplicates': boolean;
+  'media.delete_duplicates': boolean;
+  'media.restore_deleted': boolean;
   'media.copy_url': boolean;
   'media.delete': boolean;
 
@@ -170,7 +178,12 @@ export const PERMISSION_GROUPS: PermissionGroup[] = [
     permissions: [
       { key: 'media.view', label: 'Visualizar Galeria' },
       { key: 'media.upload', label: 'Fazer Upload de Fotos' },
+      { key: 'media.bulk_upload', label: 'Fazer Upload em Massa (400+ fotos)' },
       { key: 'media.edit_metadata', label: 'Editar Metadados / Alt text' },
+      { key: 'media.bulk_edit', label: 'Edição em Massa de Metadados' },
+      { key: 'media.manage_albums', label: 'Gerenciar Álbuns e Eventos' },
+      { key: 'media.ai_organize', label: 'Organizar e Analisar com IA (Gemini)' },
+      { key: 'media.ai_review', label: 'Revisar Agrupamentos de IA' },
       { key: 'media.copy_url', label: 'Copiar Links de Ativos' },
       { key: 'media.delete', label: 'Excluir Mídia' },
     ],
@@ -600,12 +613,83 @@ export interface Ambassador {
   updatedAt?: string;
 }
 
+export type MediaCategory =
+  | 'EVENTO'
+  | 'EMBAIXADOR'
+  | 'INSTITUCIONAL'
+  | 'LOGO'
+  | 'BRASÃO / SELO'
+  | 'ÍCONE / FAVICON'
+  | 'BANNER'
+  | 'PROGRAMA'
+  | 'NOTÍCIA'
+  | 'DOCUMENTO / MATERIAL GRÁFICO'
+  | 'PAÍS / PROJETO'
+  | 'OUTROS'
+  | 'NÃO CLASSIFICADO';
+
+export interface MediaUsageLocation {
+  module?: 'Home' | 'Embaixadores' | 'Notícias' | 'Programas' | 'Configurações' | 'Galeria' | string;
+  entityType?: string;
+  entityId?: string;
+  entityTitle?: string;
+  title?: string;
+  field?: string;
+  pageUrl?: string;
+  url?: string;
+}
+
+export interface AISuggestionData {
+  category?: MediaCategory;
+  suggestedCategory?: MediaCategory;
+  suggestedOrganizedName?: string;
+  suggestedTitle?: string;
+  suggestedDescription?: string;
+  tags?: string[];
+  probableEventType?: string;
+  visualContext?: string;
+  visibleText?: string;
+  confidence?: number;
+  status: 'pending' | 'approved' | 'rejected';
+}
+
+export interface NamingConfig {
+  prefix?: string;
+  globalPrefix?: string;
+  rules?: Partial<Record<MediaCategory, string>>;
+  categoryTemplates?: Record<string, string>;
+}
+
+export interface AcervoDiagnosticReport {
+  totalScanned: number;
+  categoryCounts: Record<string, number>;
+  duplicateGroupsCount: number;
+  pendingDuplicatesCount?: number;
+  unclassifiedCount: number;
+  renamePreviewCount: number;
+  renamePreviews: {
+    assetId: string;
+    originalName: string;
+    currentName: string;
+    suggestedOrganizedName: string;
+    category: MediaCategory;
+    status: 'ready' | 'needs_info';
+  }[];
+  duplicateGroups: DuplicateGroup[];
+}
+
 export interface MediaAsset {
   id: string;
   filename: string;
   originalName: string;
+  organizedName?: string;
+  displayName?: string;
+  storageKey?: string;
   title?: string;
+  description?: string;
   url: string;
+  thumbUrl?: string;
+  mediumUrl?: string;
   mimeType: string;
   sizeBytes: number;
   fileSize?: string;
@@ -615,6 +699,189 @@ export interface MediaAsset {
   tags: string[];
   createdAt: string;
   usageCount?: number;
+  usageLocations?: MediaUsageLocation[];
+
+  // Hash & Deduplication
+  sha256?: string;
+  pHash?: string;
+  dHash?: string;
+  isDuplicate?: boolean;
+  duplicateOfId?: string;
+  duplicateStatus?: 'none' | 'pending_review' | 'confirmed_duplicate' | 'keep_both' | 'not_duplicate';
+  duplicateGroupId?: string;
+  duplicateMatchId?: string;
+  similarityScore?: number;
+  duplicateClassification?: 'DUPLICATA_EXATA' | 'PROVAVEL_DUPLICATA' | 'POSSIVEL_DUPLICATA' | 'IMAGEM_SEMELHANTE';
+  
+  // Folders & Soft Delete
+  originalFolder?: string;
+  originalPath?: string;
+  isDeleted?: boolean;
+  deletedAt?: string;
+  deletedBy?: string;
+
+  // Albums & Organization
+  albumId?: string;
+  albumTitle?: string;
+  eventName?: string;
+  programId?: string;
+  category?: MediaCategory;
+  credit?: string;
+  captureDate?: string;
+
+  // Gemini AI Analysis & Suggestions
+  aiAnalyzed?: boolean;
+  aiAnalyzedAt?: string;
+  aiModel?: string;
+  aiAnalysisVersion?: string;
+  aiDescription?: string;
+  aiSuggestedTitle?: string;
+  aiTags?: string[];
+  aiSceneType?: 'ceremony' | 'meeting' | 'conference' | 'award' | 'institutional_visit' | 'portrait' | 'group_photo' | 'document' | 'outdoor' | 'other' | string;
+  aiProbableEventType?: string;
+  aiVisibleText?: string;
+  aiVisualContext?: string;
+  aiConfidence?: number;
+  aiSuggestedGroupId?: string;
+  aiSuggestions?: AISuggestionData;
+  aiStatus?: 'PENDING' | 'PROCESSING' | 'ANALYZED' | 'FAILED' | 'SKIPPED';
+  aiError?: string;
+}
+
+export interface MediaAlbum {
+  id: string;
+  title: string;
+  description?: string;
+  category?: 'general' | 'diplomatic' | 'humanitarian' | 'press' | 'assembly' | string;
+  coverMediaId?: string;
+  coverUrl?: string;
+  eventName?: string;
+  eventDate?: string;
+  tags: string[];
+  mediaCount: number;
+  createdAt: string;
+  updatedAt: string;
+  createdBy?: string;
+}
+
+export interface MediaImportJobItem {
+  id: string;
+  filename: string;
+  originalName: string;
+  sizeBytes: number;
+  mimeType: string;
+  status: 'WAITING' | 'UPLOADING' | 'PROCESSING' | 'COMPLETED' | 'ERROR' | 'DUPLICATE';
+  progress: number;
+  mediaId?: string;
+  mediaUrl?: string;
+  thumbUrl?: string;
+  error?: string;
+  isDuplicate?: boolean;
+  duplicateOfId?: string;
+  sha256?: string;
+}
+
+export interface MediaImportJob {
+  id: string;
+  jobName: string;
+  status: 'IDLE' | 'UPLOADING' | 'EXTRACTING' | 'VALIDATING' | 'HASHING' | 'CHECKING_DUPLICATES' | 'WAITING_DUPLICATE_REVIEW' | 'PROCESSING' | 'AI_ANALYSIS' | 'CLUSTERING' | 'WAITING_REVIEW' | 'COMPLETED' | 'CANCELLED' | 'ERROR';
+  totalItems: number;
+  uploadedItems: number;
+  processedItems: number;
+  failedItems: number;
+  duplicateItems: number;
+  items: MediaImportJobItem[];
+  
+  // Archive import stats
+  archiveName?: string;
+  archiveType?: 'zip' | 'rar' | '7z';
+  totalFilesFound?: number;
+  validImagesCount?: number;
+  ignoredFilesCount?: number;
+  ignoredFilesList?: { name: string; reason: string }[];
+  exactDuplicatesCount?: number;
+  probableDuplicatesCount?: number;
+  possibleDuplicatesCount?: number;
+
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  createdBy?: string;
+}
+
+export interface DuplicateGroup {
+  id: string;
+  groupNumber: string;
+  primaryMediaId: string;
+  mediaIds: string[];
+  similarityScore: number;
+  classification: 'DUPLICATA_EXATA' | 'PROVAVEL_DUPLICATA' | 'POSSIVEL_DUPLICATA' | 'IMAGEM_SEMELHANTE';
+  usageCategory?: 'DUPLICATA_NAO_UTILIZADA' | 'DUPLICATA_EM_USO' | 'DUPLICATA_USOS_DIFERENTES' | 'DUPLICATA_CONSOLIDAVEL' | 'DUPLICATA_NAO_CONSOLIDAVEL' | 'DUPLICATA_CONSOLIDACAO_INCOMPLETA';
+  is100PercentIdentical?: boolean;
+  assetUsages?: Record<string, MediaUsageLocation[]>;
+  status: 'pending_review' | 'resolved' | 'dismissed' | 'resolved_incomplete';
+  createdAt: string;
+  updatedAt: string;
+  recommendation?: {
+    keepMediaId: string;
+    deleteMediaIds: string[];
+    reason: string;
+  };
+}
+
+export interface AIClusterGroup {
+  id: string;
+  title: string;
+  suggestedEventType: string;
+  sceneType: string;
+  confidence: 'ALTA' | 'MÉDIA' | 'BAIXA' | number;
+  description: string;
+  mediaIds: string[];
+  visibleTexts: string[];
+  dateRange?: { start?: string; end?: string };
+  status: 'SUGGESTED' | 'APPROVED' | 'MODIFIED' | 'DISCARDED';
+}
+
+export type MediaAIJobStatus = 
+  | 'PENDING' 
+  | 'RUNNING' 
+  | 'RATE_LIMITED' 
+  | 'PAUSED' 
+  | 'COMPLETED' 
+  | 'COMPLETED_WITH_ERRORS' 
+  | 'FAILED' 
+  | 'CANCELLED' 
+  | 'INTERRUPTED';
+
+export interface MediaAIJob {
+  id: string;
+  status: MediaAIJobStatus;
+  totalItems: number;
+  processedItems: number;
+  successItems: number;
+  failedItems: number;
+  skippedItems: number;
+  pendingMediaIds: string[];
+  processedMediaIds: string[];
+  lastMediaId?: string;
+  lastMediaName?: string;
+  modelUsed: string;
+  analysisVersion: string;
+  lastError?: string;
+  rateLimitWaitUntil?: string; // ISO string
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  createdBy?: string;
+}
+
+export interface AIOrganizationResult {
+  jobId?: string;
+  totalAnalyzed: number;
+  clusters: AIClusterGroup[];
+  unclusteredMediaIds: string[];
+  analyzedAt: string;
 }
 
 export interface Donation {
@@ -767,6 +1034,10 @@ export type AuditActionType =
   | 'Criação'
   | 'Alteração'
   | 'Exclusão'
+  | 'Exclusão em Massa'
+  | 'Edição em Massa'
+  | 'Sessão de Importação'
+  | 'Revisão de Duplicidades'
   | 'Login'
   | 'Logout'
   | 'Convite criado'
@@ -794,7 +1065,7 @@ export interface AuditLog {
   userEmail: string;
   userName: string;
   action: AuditActionType;
-  module: 'Home' | 'Programs' | 'News' | 'Ambassadors' | 'Photos' | 'Donations' | 'Tasks' | 'Administrators' | 'Auth' | 'Assistant';
+  module: 'Home' | 'Programs' | 'News' | 'Ambassadors' | 'Photos' | 'Albums' | 'Donations' | 'Tasks' | 'Administrators' | 'Auth' | 'Assistant';
   affectedRecord: string;
   details?: string;
   beforeState?: string;

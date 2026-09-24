@@ -1,4 +1,4 @@
-import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand, PutBucketCorsCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { Upload } from '@aws-sdk/lib-storage';
 import { Readable } from 'stream';
@@ -131,5 +131,69 @@ export const PublicMediaStorage = {
     });
 
     return await getSignedUrl(client, command, { expiresIn: expiresInSeconds });
+  },
+
+  /**
+   * Generates a secure presigned PUT URL for direct client upload to R2
+   */
+  async getPresignedPutUrl(key: string, contentType: string, expiresInSeconds = 3600): Promise<string> {
+    const client = getR2Client();
+    const command = new PutObjectCommand({
+      Bucket: R2_BUCKET_NAME,
+      Key: key,
+      ContentType: contentType,
+    });
+
+    return await getSignedUrl(client, command, { expiresIn: expiresInSeconds });
+  },
+
+  /**
+   * Enforces a secure CORS configuration on the R2 bucket to allow browser direct uploads
+   */
+  async ensureBucketCors(origin: string): Promise<void> {
+    if (!isR2Configured) return;
+    try {
+      const client = getR2Client();
+      const originsToAllow = [
+        'https://ais-dev-mpovpbsy35sokjlyzu3jla-573675315275.us-east1.run.app',
+        'https://ais-pre-mpovpbsy35sokjlyzu3jla-573675315275.us-east1.run.app',
+        'http://localhost:3000',
+        'http://localhost:5173',
+      ];
+      
+      if (origin && !originsToAllow.includes(origin)) {
+        // Simple security sanity check to prevent arbitrary domain injections, allowing known patterns
+        if (
+          origin.startsWith('https://ais-dev-') || 
+          origin.startsWith('https://ais-pre-') || 
+          origin === 'http://localhost:3000' ||
+          origin === 'http://localhost:5173'
+        ) {
+          originsToAllow.push(origin);
+        }
+      }
+
+      console.log('[R2 CORS] Applying CORS policy for origins:', originsToAllow);
+
+      const command = new PutBucketCorsCommand({
+        Bucket: R2_BUCKET_NAME,
+        CORSConfiguration: {
+          CORSRules: [
+            {
+              AllowedOrigins: originsToAllow,
+              AllowedMethods: ['GET', 'PUT', 'POST', 'HEAD'],
+              AllowedHeaders: ['*'],
+              ExposeHeaders: ['ETag'],
+              MaxAgeSeconds: 3600,
+            },
+          ],
+        },
+      });
+
+      await client.send(command);
+      console.log('[R2 CORS] CORS configuration successfully applied to bucket:', R2_BUCKET_NAME);
+    } catch (err: any) {
+      console.warn('[R2 CORS WARNING] Failed to automatically set R2 bucket CORS (non-fatal):', err.message);
+    }
   }
 };

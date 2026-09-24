@@ -224,6 +224,15 @@ export function AdminDashboard({ onNavigate }: { onNavigate: (sec: AdminSection)
             <DollarSign className="w-4 h-4 text-emerald-400" />
             Doações
           </button>
+          <button
+            type="button"
+            onClick={() => onNavigate('reports')}
+            className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold px-4 py-2.5 rounded-xl border border-slate-700 transition-colors flex items-center gap-1.5"
+            title="Acessar Central de Relatórios e Impressão"
+          >
+            <BarChart3 className="w-4 h-4 text-amber-500" />
+            Relatórios
+          </button>
           {isOwner && (
             <button
               type="button"

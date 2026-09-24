@@ -8,6 +8,7 @@ import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { apiRouter } from './src/server/routes';
+import { startAIWorker } from './src/server/aiMediaWorker';
 
 async function startServer() {
   (global as any).__startup_timers.startServerStart = performance.now();
@@ -17,6 +18,11 @@ async function startServer() {
   // Mount API router FIRST before frontend
   app.use('/api', apiRouter);
   (global as any).__startup_timers.routesReady = performance.now();
+
+  // API 404 Fallback - Any unmatched route starting with /api must return JSON 404, never SPA HTML
+  app.all('/api/*', (req, res) => {
+    res.status(404).json({ error: `Rota API não encontrada: ${req.method} ${req.originalUrl}` });
+  });
 
   // Serve public static assets (media, documents, icons)
   app.use(express.static(path.join(process.cwd(), 'public')));
@@ -41,6 +47,9 @@ async function startServer() {
   app.listen(PORT, '0.0.0.0', () => {
     (global as any).__startup_timers.listenCallback = performance.now();
     console.log(`[ADMIR Server] Running on http://0.0.0.0:${PORT}`);
+
+    // Launch background workers
+    startAIWorker().catch(err => console.error('[AI_Worker_Startup_Error]', err));
 
     const timers = (global as any).__startup_timers;
     const procToDbStart = (timers.dbInitStart || 0).toFixed(2);

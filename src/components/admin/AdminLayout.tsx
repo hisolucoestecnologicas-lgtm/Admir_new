@@ -18,6 +18,7 @@ import {
   Menu,
   X,
   UserCheck,
+  Printer,
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { useSite } from '../../context/SiteContext';
@@ -38,10 +39,12 @@ import { AdminHistory } from './AdminHistory';
 import { AdminAssistant } from './AdminAssistant';
 import { AdminMaintenance } from './AdminMaintenance';
 import { DataSyncManager } from './DataSyncManager';
+import { AdminReports } from './AdminReports';
 import { Bot, Wrench, Database } from 'lucide-react';
 
 export type AdminSection =
   | 'overview'
+  | 'reports'
   | 'home-texts'
   | 'programs'
   | 'news'
@@ -74,6 +77,7 @@ export function AdminLayout() {
 
   const navItems = [
     { id: 'overview', label: 'Visão Geral', icon: LayoutDashboard, perm: null },
+    { id: 'reports', label: 'Relatórios & Impressão', icon: Printer, perm: null },
     { id: 'home-texts', label: 'Textos da Home', icon: FileText, perm: 'home.view' as const },
     { id: 'programs', label: 'Programas', icon: FolderKanban, perm: 'programs.view' as const },
     { id: 'news', label: 'Notícias & Histórias', icon: Newspaper, perm: 'news.view' as const },
@@ -233,6 +237,7 @@ export function AdminLayout() {
         {/* Main Content Area */}
         <main className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
           {activeSection === 'overview' && <AdminDashboard onNavigate={(sec) => setActiveSection(sec)} />}
+          {activeSection === 'reports' && <AdminReports />}
           {activeSection === 'home-texts' && <AdminHomeTexts />}
           {activeSection === 'programs' && <AdminPrograms />}
           {activeSection === 'news' && <AdminNews />}

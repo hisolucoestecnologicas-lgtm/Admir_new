@@ -2,6 +2,7 @@ import { performance } from 'perf_hooks';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { compareMediaAssets, generateDuplicateRecommendation } from './duplicateDetector';
 import {
   SiteSettings,
   Program,
@@ -9,6 +10,11 @@ import {
   Ambassador,
   PrivateDocument,
   MediaAsset,
+  MediaAlbum,
+  MediaImportJob,
+  MediaAIJob,
+  DuplicateGroup,
+  AIClusterGroup,
   Donation,
   PaymentEvent,
   Task,
@@ -33,7 +39,13 @@ import {
   UserRole,
   MaintenanceSettings,
   MaintenanceConfig,
+  MediaCategory,
+  MediaUsageLocation,
+  AISuggestionData,
+  NamingConfig,
+  AcervoDiagnosticReport,
 } from '../types';
+import { DEFAULT_NAMING_CONFIG, generateOrganizedName } from './namingService';
 import {
   INITIAL_SITE_SETTINGS,
   INITIAL_PROGRAMS,
@@ -74,6 +86,12 @@ interface DatabaseSchema {
   contactRequests?: ContactRequest[];
   assistantFeedbacks?: AssistantChatFeedback[];
   maintenanceSettings?: MaintenanceSettings;
+  albums?: MediaAlbum[];
+  importJobs?: MediaImportJob[];
+  duplicateGroups?: DuplicateGroup[];
+  namingConfig?: NamingConfig;
+  aiClusterProposals?: AIClusterGroup[];
+  aiJobs?: MediaAIJob[];
 }
 
 export interface RequestMetadata {
@@ -187,6 +205,10 @@ class DatabaseService {
           }
           if (!parsed.contactRequests) parsed.contactRequests = [];
           if (!parsed.assistantFeedbacks) parsed.assistantFeedbacks = [];
+          if (!parsed.albums) parsed.albums = [];
+          if (!parsed.importJobs) parsed.importJobs = [];
+          if (!parsed.aiClusterProposals) parsed.aiClusterProposals = [];
+          if (!parsed.aiJobs) parsed.aiJobs = [];
           if (!parsed.maintenanceSettings) {
             parsed.maintenanceSettings = JSON.parse(JSON.stringify(INITIAL_MAINTENANCE_SETTINGS));
           }
@@ -210,6 +232,9 @@ class DatabaseService {
       stories: [...INITIAL_STORIES],
       ambassadors: [...INITIAL_AMBASSADORS],
       media: [...INITIAL_MEDIA_ASSETS],
+      albums: [],
+      importJobs: [],
+      aiJobs: [],
       donations: [...INITIAL_DONATIONS],
       paymentEvents: [],
       tasks: [...INITIAL_TASKS],
@@ -1113,9 +1138,13 @@ class DatabaseService {
   }
 
   // --- MEDIA LIBRARY ---
-  public getMedia(): MediaAsset[] {
+  public getMedia(includeDeleted = false): MediaAsset[] {
     // calculate usage count dynamically across programs, stories, ambassadors, settings
-    const media = [...this.data.media];
+    let media = [...this.data.media];
+    if (!includeDeleted) {
+      media = media.filter((m) => !m.isDeleted);
+    }
+
     const stringifiedAll = JSON.stringify({
       settings: this.data.settings,
       programs: this.data.programs,
@@ -1132,8 +1161,8 @@ class DatabaseService {
     });
   }
 
-  public addMedia(asset: Omit<MediaAsset, 'id' | 'createdAt'>, user: User, meta?: RequestMetadata): MediaAsset {
-    const id = `media-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+  public addMedia(asset: Omit<MediaAsset, 'id' | 'createdAt'> & { id?: string }, user: User, meta?: RequestMetadata): MediaAsset {
+    const id = asset.id || `media-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     const newAsset: MediaAsset = {
       ...asset,
       id,
@@ -1146,6 +1175,56 @@ class DatabaseService {
 
     this.recordAuditLog(user, 'Upload', 'Photos', newAsset.originalName, `Arquivo "${newAsset.originalName}" enviado à biblioteca de mídia`, meta);
     return newAsset;
+  }
+
+  /**
+   * Repairs duplicate groups by removing non-existent media IDs and duplicates within the group.
+   * This restores integrity after a faulty import.
+   */
+  public repairDuplicateGroups(): void {
+    if (!this.data.duplicateGroups) return;
+
+    const activeMediaIds = new Set(this.data.media.filter(m => !m.isDeleted).map(m => m.id));
+    let changed = false;
+
+    this.data.duplicateGroups = this.data.duplicateGroups.filter(group => {
+      const originalCount = group.mediaIds.length;
+      
+      // Keep only existing IDs and remove duplicates
+      const validIds = Array.from(new Set(group.mediaIds.filter(id => activeMediaIds.has(id))));
+      
+      if (validIds.length !== originalCount) {
+        group.mediaIds = validIds;
+        group.updatedAt = new Date().toISOString();
+        changed = true;
+      }
+
+      // If group has fewer than 2 members, it's no longer a duplicate group
+      if (group.mediaIds.length < 2) {
+        changed = true;
+        // Also clear flags from the remaining asset
+        if (group.mediaIds.length === 1) {
+          const asset = this.data.media.find(m => m.id === group.mediaIds[0]);
+          if (asset) {
+            asset.duplicateGroupId = undefined;
+            asset.duplicateStatus = 'none';
+          }
+        }
+        return false;
+      }
+
+      // Re-generate recommendation if members changed
+      if (changed) {
+        const groupAssets = this.data.media.filter(m => group.mediaIds.includes(m.id));
+        group.recommendation = generateDuplicateRecommendation(groupAssets);
+      }
+
+      return true;
+    });
+
+    if (changed) {
+      this.save();
+    }
   }
 
   public updateMedia(id: string, updates: Partial<MediaAsset>, user: User, meta?: RequestMetadata): MediaAsset {
@@ -1177,6 +1256,1211 @@ class DatabaseService {
 
     this.recordAuditLog(user, 'Exclusão', 'Photos', item.originalName, `Foto/mídia "${item.originalName}" excluída do acervo`, meta);
     return { success: true, usageCount: occurrences };
+  }
+
+  public findMediaBySha256(sha256: string): MediaAsset | undefined {
+    if (!sha256) return undefined;
+    return this.data.media.find((m) => m.sha256 === sha256);
+  }
+
+  public bulkUpdateMedia(ids: string[], updates: Partial<MediaAsset>, user: User, meta?: RequestMetadata): MediaAsset[] {
+    const updated: MediaAsset[] = [];
+    const idSet = new Set(ids);
+
+    this.data.media = this.data.media.map((item) => {
+      if (idSet.has(item.id)) {
+        const newItem = { ...item, ...updates };
+        updated.push(newItem);
+        return newItem;
+      }
+      return item;
+    });
+
+    this.save();
+    this.recordAuditLog(user, 'Edição em Massa', 'Photos', `${updated.length} itens`, `Edição em massa aplicada a ${updated.length} mídias`, meta);
+    return updated;
+  }
+
+  // --- ALBUMS & EVENTS ---
+  public getAlbums(): MediaAlbum[] {
+    if (!this.data.albums) this.data.albums = [];
+    return [...this.data.albums].map((album) => {
+      const mediaCount = this.data.media.filter((m) => m.albumId === album.id).length;
+      return { ...album, mediaCount };
+    });
+  }
+
+  public createAlbum(data: Omit<MediaAlbum, 'id' | 'createdAt' | 'updatedAt' | 'mediaCount'>, user: User, meta?: RequestMetadata): MediaAlbum {
+    if (!this.data.albums) this.data.albums = [];
+    const id = `album-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const now = new Date().toISOString();
+    const newAlbum: MediaAlbum = {
+      ...data,
+      id,
+      mediaCount: 0,
+      createdAt: now,
+      updatedAt: now,
+      createdBy: user.name || user.email,
+    };
+
+    this.data.albums.unshift(newAlbum);
+    this.save();
+    this.recordAuditLog(user, 'Criação', 'Albums', newAlbum.title, `Álbum/Evento "${newAlbum.title}" criado`, meta);
+    return newAlbum;
+  }
+
+  public updateAlbum(id: string, updates: Partial<MediaAlbum>, user: User, meta?: RequestMetadata): MediaAlbum {
+    if (!this.data.albums) this.data.albums = [];
+    const idx = this.data.albums.findIndex((a) => a.id === id);
+    if (idx === -1) throw new Error('Álbum não encontrado');
+
+    const updatedAlbum = {
+      ...this.data.albums[idx],
+      ...updates,
+      updatedAt: new Date().toISOString(),
+    };
+    this.data.albums[idx] = updatedAlbum;
+    this.save();
+    this.recordAuditLog(user, 'Alteração', 'Albums', updatedAlbum.title, `Álbum "${updatedAlbum.title}" atualizado`, meta);
+    return updatedAlbum;
+  }
+
+  public deleteAlbum(id: string, user: User, meta?: RequestMetadata): boolean {
+    if (!this.data.albums) this.data.albums = [];
+    const album = this.data.albums.find((a) => a.id === id);
+    if (!album) return false;
+
+    // Disassociate media from album without deleting the underlying photo files
+    this.data.media = this.data.media.map((m) => (m.albumId === id ? { ...m, albumId: undefined, albumTitle: undefined } : m));
+    this.data.albums = this.data.albums.filter((a) => a.id !== id);
+    this.save();
+    this.recordAuditLog(user, 'Exclusão', 'Albums', album.title, `Álbum "${album.title}" removido`, meta);
+    return true;
+  }
+
+  // --- MEDIA IMPORT JOBS ---
+  public getImportJobs(): MediaImportJob[] {
+    if (!this.data.importJobs) this.data.importJobs = [];
+    return [...this.data.importJobs];
+  }
+
+  public getImportJob(id: string): MediaImportJob | undefined {
+    if (!this.data.importJobs) this.data.importJobs = [];
+    return this.data.importJobs.find((j) => j.id === id);
+  }
+
+  public createImportJob(data: Omit<MediaImportJob, 'id' | 'createdAt' | 'updatedAt'>, user: User, meta?: RequestMetadata): MediaImportJob {
+    if (!this.data.importJobs) this.data.importJobs = [];
+    const id = `job-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const now = new Date().toISOString();
+    const newJob: MediaImportJob = {
+      ...data,
+      id,
+      createdAt: now,
+      updatedAt: now,
+      createdBy: user.name || user.email,
+    };
+
+    this.data.importJobs.unshift(newJob);
+    this.save();
+    this.recordAuditLog(user, 'Sessão de Importação', 'Photos', newJob.jobName, `Sessão de importação em massa "${newJob.jobName}" iniciada (${newJob.totalItems} itens)`, meta);
+    return newJob;
+  }
+
+  public updateImportJob(id: string, updates: Partial<MediaImportJob>): MediaImportJob {
+    if (!this.data.importJobs) this.data.importJobs = [];
+    const idx = this.data.importJobs.findIndex((j) => j.id === id);
+    if (idx === -1) throw new Error('Import Job não encontrado');
+
+    const updatedJob = {
+      ...this.data.importJobs[idx],
+      ...updates,
+      updatedAt: new Date().toISOString(),
+    };
+    this.data.importJobs[idx] = updatedJob;
+    this.save();
+    return updatedJob;
+  }
+
+  // --- MEDIA AI ANALYSIS JOBS ---
+  public getAIJobs(): MediaAIJob[] {
+    if (!this.data.aiJobs) this.data.aiJobs = [];
+    return [...this.data.aiJobs];
+  }
+
+  public getAIJob(id: string): MediaAIJob | undefined {
+    if (!this.data.aiJobs) this.data.aiJobs = [];
+    return this.data.aiJobs.find((j) => j.id === id);
+  }
+
+  public getActiveAIJob(): MediaAIJob | undefined {
+    if (!this.data.aiJobs) this.data.aiJobs = [];
+    return this.data.aiJobs.find((j) => j.status === 'RUNNING' || j.status === 'RATE_LIMITED' || j.status === 'PENDING');
+  }
+
+  public createAIJob(data: Omit<MediaAIJob, 'id' | 'createdAt' | 'updatedAt'>, user: User, meta?: RequestMetadata): MediaAIJob {
+    if (!this.data.aiJobs) this.data.aiJobs = [];
+    const id = `ai-job-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const now = new Date().toISOString();
+    const newJob: MediaAIJob = {
+      ...data,
+      id,
+      createdAt: now,
+      updatedAt: now,
+      createdBy: user.name || user.email,
+    };
+
+    this.data.aiJobs.unshift(newJob);
+    this.save();
+    this.recordAuditLog(user, 'Alteração', 'Photos', `Job de IA ${id}`, `Novo job de análise IA Gemini iniciado para ${newJob.totalItems} fotos.`, meta);
+    return newJob;
+  }
+
+  public updateAIJob(id: string, updates: Partial<MediaAIJob>): MediaAIJob {
+    if (!this.data.aiJobs) this.data.aiJobs = [];
+    const idx = this.data.aiJobs.findIndex((j) => j.id === id);
+    if (idx === -1) throw new Error('AI Job não encontrado');
+
+    const updatedJob = {
+      ...this.data.aiJobs[idx],
+      ...updates,
+      updatedAt: new Date().toISOString(),
+    };
+    this.data.aiJobs[idx] = updatedJob;
+    this.save();
+    return updatedJob;
+  }
+
+  // --- DUPLICATE GROUPS & REVIEW ---
+  public getDuplicateGroups(): DuplicateGroup[] {
+    this.repairDuplicateGroups();
+    if (!this.data.duplicateGroups) this.data.duplicateGroups = [];
+    return [...this.data.duplicateGroups];
+  }
+
+  public getDuplicateGroupById(id: string): DuplicateGroup | undefined {
+    if (!this.data.duplicateGroups) this.data.duplicateGroups = [];
+    return this.data.duplicateGroups.find((g) => g.id === id);
+  }
+
+  public saveDuplicateGroup(group: DuplicateGroup): DuplicateGroup {
+    if (!this.data.duplicateGroups) this.data.duplicateGroups = [];
+    const idx = this.data.duplicateGroups.findIndex((g) => g.id === group.id);
+    if (idx >= 0) {
+      this.data.duplicateGroups[idx] = { ...this.data.duplicateGroups[idx], ...group, updatedAt: new Date().toISOString() };
+    } else {
+      this.data.duplicateGroups.unshift(group);
+    }
+    this.save();
+    return group;
+  }
+
+  public deleteDuplicateGroup(id: string): boolean {
+    if (!this.data.duplicateGroups) this.data.duplicateGroups = [];
+    this.data.duplicateGroups = this.data.duplicateGroups.filter((g) => g.id !== id);
+    this.save();
+    return true;
+  }
+
+  public dismissDuplicateGroup(
+    groupId?: string,
+    mediaIds?: string[],
+    user?: User,
+    meta?: RequestMetadata
+  ): { success: boolean; message: string } {
+    if (groupId) {
+      if (this.data.duplicateGroups) {
+        const group = this.data.duplicateGroups.find((g) => g.id === groupId);
+        if (group) {
+          group.status = 'dismissed';
+          // Also mark individual assets as not_duplicate so they don't reapppear in next scans
+          group.mediaIds.forEach((id) => {
+            const asset = this.data.media.find((m) => m.id === id);
+            if (asset) {
+              asset.duplicateStatus = 'not_duplicate';
+            }
+          });
+        }
+      }
+    } else if (mediaIds) {
+      mediaIds.forEach((id) => {
+        const asset = this.data.media.find((m) => m.id === id);
+        if (asset) {
+          asset.duplicateStatus = 'not_duplicate';
+        }
+      });
+    }
+
+    this.save();
+
+    if (user) {
+      this.recordAuditLog(
+        user,
+        'Decisão de Duplicidade' as any,
+        'Photos',
+        'Múltiplos Arquivos',
+        `Arquivos marcados como "Não Duplicados". Eles serão ignorados em verificações futuras.`,
+        meta
+      );
+    }
+
+    return {
+      success: true,
+      message: 'Os arquivos foram marcados como não duplicados e não aparecerão em verificações futuras.',
+    };
+  }
+
+  public scanLibraryForDuplicates(user?: User, meta?: RequestMetadata): { 
+    totalScanned: number; 
+    newGroupsCount: number; 
+    reevaluatedCount: number;
+    removedCount: number;
+    reclassifiedCount: number;
+    keptCount: number;
+    groups: DuplicateGroup[] 
+  } {
+    const activeMedia = this.getMedia(false);
+    // filter not_duplicate explicitly marked by user in the asset itself
+    const scannableMedia = activeMedia.filter(m => m.duplicateStatus !== 'not_duplicate');
+    
+    if (!this.data.duplicateGroups) this.data.duplicateGroups = [];
+
+    const now = new Date().toISOString();
+    let reevaluatedCount = 0;
+    let removedCount = 0;
+    let reclassifiedCount = 0;
+    let keptCount = 0;
+    let newGroupsCount = 0;
+
+    // 1. RE-EVALUATE ALL NON-DISMISSED GROUPS
+    const updatedGroups: DuplicateGroup[] = [];
+    
+    for (const group of this.data.duplicateGroups) {
+      // If group is already dismissed, keep it but check if assets still exist
+      if (group.status === 'dismissed') {
+        const remainingIds = group.mediaIds.filter(id => activeMedia.some(m => m.id === id));
+        if (remainingIds.length >= 2) {
+          group.mediaIds = remainingIds;
+          updatedGroups.push(group);
+        }
+        continue;
+      }
+
+      // If group is resolved, check for "Incomplete Consolidation"
+      if (group.status === 'resolved' || group.status === 'resolved_incomplete') {
+        const assets = activeMedia.filter(m => group.mediaIds.includes(m.id));
+        const masterId = group.recommendation?.keepMediaId || group.primaryMediaId;
+        const redundantAssets = assets.filter(a => a.id !== masterId);
+        
+        let incomplete = false;
+        for (const red of redundantAssets) {
+          const locs = this.getMediaUsageLocations(red);
+          // If the supposedly redundant asset is NOT deleted OR still has references
+          if (!red.isDeleted || locs.length > 0) {
+            incomplete = true;
+            break;
+          }
+        }
+        
+        if (incomplete) {
+          group.status = 'resolved_incomplete';
+          group.usageCategory = 'DUPLICATA_CONSOLIDACAO_INCOMPLETA';
+        } else {
+          group.status = 'resolved';
+          // category will be set in the enrichment phase
+        }
+        
+        // Keep the group if assets still exist in the system (even if in trash)
+        const allSystemAssets = this.getMedia(true).filter(m => group.mediaIds.includes(m.id));
+        if (allSystemAssets.length >= 2) {
+          updatedGroups.push(group);
+        }
+        continue;
+      }
+
+      // ONLY RE-EVALUATE PENDING GROUPS
+      if (group.status === 'pending_review') {
+        reevaluatedCount++;
+        const groupAssets = activeMedia.filter(m => group.mediaIds.includes(m.id));
+        
+        if (groupAssets.length < 2) {
+          removedCount++;
+          // Clear asset back-references
+          groupAssets.forEach(a => {
+            a.duplicateGroupId = undefined;
+            a.duplicateStatus = undefined;
+          });
+          continue; 
+        }
+
+        const primary = groupAssets.find(a => a.id === group.primaryMediaId) || groupAssets[0];
+        const stillValidMembers: MediaAsset[] = [primary];
+        let maxScore = 0;
+        let topClassification: DuplicateGroup['classification'] = 'IMAGEM_SEMELHANTE';
+
+        for (const asset of groupAssets) {
+          if (asset.id === primary.id) continue;
+          
+          // FORCED RE-EVALUATION WITH CURRENT ALGORITHM
+          const cmp = compareMediaAssets(primary, asset);
+          
+          if (cmp.similarityScore >= 75) {
+            stillValidMembers.push(asset);
+            if (cmp.similarityScore > maxScore) {
+              maxScore = cmp.similarityScore;
+              topClassification = cmp.classification;
+            }
+          }
+        }
+
+        if (stillValidMembers.length < 2) {
+          removedCount++;
+          groupAssets.forEach(a => {
+            a.duplicateGroupId = undefined;
+            a.duplicateStatus = undefined;
+          });
+          continue;
+        }
+
+        // Reclassified?
+        if (group.similarityScore !== maxScore || group.classification !== topClassification) {
+          reclassifiedCount++;
+          group.similarityScore = maxScore;
+          group.classification = topClassification;
+        } else {
+          keptCount++;
+        }
+
+        group.mediaIds = stillValidMembers.map(m => m.id);
+        group.updatedAt = now;
+        group.recommendation = generateDuplicateRecommendation(stillValidMembers);
+        
+        // Ensure asset back-references are correct
+        stillValidMembers.forEach(a => {
+          a.duplicateGroupId = group.id;
+          a.duplicateStatus = 'pending_review';
+        });
+
+        updatedGroups.push(group);
+      }
+    }
+
+    this.data.duplicateGroups = updatedGroups;
+
+    // 2. SCAN FOR NEW DUPLICATES
+    for (let i = 0; i < scannableMedia.length; i++) {
+      for (let j = i + 1; j < scannableMedia.length; j++) {
+        const assetA = scannableMedia[i];
+        const assetB = scannableMedia[j];
+
+        // Skip if same group
+        if (assetA.duplicateGroupId && assetA.duplicateGroupId === assetB.duplicateGroupId) continue;
+
+        const cmp = compareMediaAssets(assetA, assetB);
+        if (cmp.similarityScore >= 75) {
+          // Add to existing pending group or create new
+          let targetGroup = this.data.duplicateGroups.find(g => 
+            (g.id === assetA.duplicateGroupId || g.id === assetB.duplicateGroupId) && 
+            g.status === 'pending_review'
+          );
+
+          if (targetGroup) {
+            if (!targetGroup.mediaIds.includes(assetA.id)) targetGroup.mediaIds.push(assetA.id);
+            if (!targetGroup.mediaIds.includes(assetB.id)) targetGroup.mediaIds.push(assetB.id);
+            if (cmp.similarityScore > targetGroup.similarityScore) {
+              targetGroup.similarityScore = cmp.similarityScore;
+              targetGroup.classification = cmp.classification;
+            }
+            targetGroup.updatedAt = now;
+            const groupAssets = activeMedia.filter((a) => targetGroup!.mediaIds.includes(a.id));
+            targetGroup.recommendation = generateDuplicateRecommendation(groupAssets);
+            
+            assetA.duplicateGroupId = targetGroup.id;
+            assetA.duplicateStatus = 'pending_review';
+            assetB.duplicateGroupId = targetGroup.id;
+            assetB.duplicateStatus = 'pending_review';
+          } else {
+            // New group
+            const groupId = `dup_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+            const newGroup: DuplicateGroup = {
+              id: groupId,
+              groupNumber: String(this.data.duplicateGroups.length + 1).padStart(4, '0'),
+              primaryMediaId: assetA.id,
+              mediaIds: [assetA.id, assetB.id],
+              similarityScore: cmp.similarityScore,
+              classification: cmp.classification,
+              status: 'pending_review',
+              createdAt: now,
+              updatedAt: now,
+              recommendation: generateDuplicateRecommendation([assetA, assetB]),
+            };
+            this.data.duplicateGroups.unshift(newGroup);
+            newGroupsCount++;
+            assetA.duplicateGroupId = groupId;
+            assetA.duplicateStatus = 'pending_review';
+            assetB.duplicateGroupId = groupId;
+            assetB.duplicateStatus = 'pending_review';
+          }
+        }
+      }
+    }
+
+    // 3. ENRICH AND FINALIZE (Usage Categories)
+    for (const group of this.data.duplicateGroups) {
+      const groupAssets = activeMedia.filter((a) => group.mediaIds.includes(a.id));
+      const assetUsages: Record<string, MediaUsageLocation[]> = {};
+      let totalLocationsCount = 0;
+      const modulesSet = new Set<string>();
+
+      for (const asset of groupAssets) {
+        const locs = this.getMediaUsageLocations(asset);
+        assetUsages[asset.id] = locs;
+        totalLocationsCount += locs.length;
+        locs.forEach((l) => modulesSet.add(`${l.module || 'Geral'}:${l.field || 'Principal'}`));
+      }
+
+      group.assetUsages = assetUsages;
+      group.is100PercentIdentical = group.similarityScore >= 99 || group.classification === 'DUPLICATA_EXATA';
+
+      if (group.status === 'resolved_incomplete') {
+        group.usageCategory = 'DUPLICATA_CONSOLIDACAO_INCOMPLETA';
+      } else {
+        const hasFavicon = groupAssets.some((a) => a.category === 'ÍCONE / FAVICON' || (a.dimensions && parseInt(a.dimensions.split('x')[0]) <= 128));
+        const hasLargeImage = groupAssets.some((a) => a.dimensions && parseInt(a.dimensions.split('x')[0]) >= 800);
+
+        if (hasFavicon && hasLargeImage) {
+          group.usageCategory = 'DUPLICATA_NAO_CONSOLIDAVEL';
+        } else if (totalLocationsCount === 0) {
+          group.usageCategory = 'DUPLICATA_NAO_UTILIZADA';
+        } else if (modulesSet.size >= 2) {
+          group.usageCategory = 'DUPLICATA_USOS_DIFERENTES';
+        } else if (totalLocationsCount > 0) {
+          group.usageCategory = 'DUPLICATA_EM_USO';
+        } else {
+          group.usageCategory = 'DUPLICATA_CONSOLIDAVEL';
+        }
+      }
+    }
+
+    this.save();
+    
+    if (user) {
+      this.recordAuditLog(user, 'Revisão de Duplicidades' as any, 'Photos', 'Revarredura da Biblioteca', 
+        `Revarredura concluída: ${activeMedia.length} mídias analisadas. ` +
+        `${reevaluatedCount} grupos reavaliados, ${removedCount} removidos, ${reclassifiedCount} reclassificados, ${newGroupsCount} novos.`, 
+        meta);
+    }
+
+    return {
+      totalScanned: scannableMedia.length,
+      newGroupsCount,
+      reevaluatedCount,
+      removedCount,
+      reclassifiedCount,
+      keptCount,
+      groups: this.data.duplicateGroups,
+    };
+  }
+
+  // --- SOFT DELETE & LIXEIRA (TRASH) ---
+  public softDeleteMedia(id: string, user?: User, meta?: RequestMetadata): boolean {
+    const idx = this.data.media.findIndex((m) => m.id === id);
+    if (idx === -1) return false;
+
+    const media = this.data.media[idx];
+    if (media.isDeleted) return true; // Already in trash, skip redundant log
+
+    media.isDeleted = true;
+    media.deletedAt = new Date().toISOString();
+    media.deletedBy = user ? (user.name || user.email) : 'Administrador';
+
+    this.save();
+    if (user) {
+      this.recordAuditLog(user, 'Exclusão', 'Photos', media.title || media.originalName, `Mídia "${media.originalName}" movida para a Lixeira`, meta);
+    }
+    return true;
+  }
+
+  public bulkSoftDeleteMedia(ids: string[], user?: User, meta?: RequestMetadata): MediaAsset[] {
+    const idSet = new Set(ids);
+    const deleted: MediaAsset[] = [];
+    const now = new Date().toISOString();
+
+    this.data.media = this.data.media.map((item) => {
+      if (idSet.has(item.id)) {
+        const newItem = {
+          ...item,
+          isDeleted: true,
+          deletedAt: now,
+          deletedBy: user ? (user.name || user.email) : 'Administrador',
+        };
+        deleted.push(newItem);
+        return newItem;
+      }
+      return item;
+    });
+
+    this.save();
+    if (user && deleted.length > 0) {
+      this.recordAuditLog(user, 'Exclusão em Massa', 'Photos', `${deleted.length} mídias`, `${deleted.length} mídias movidas para a Lixeira após revisão`, meta);
+    }
+    return deleted;
+  }
+
+  public restoreMedia(id: string, user?: User, meta?: RequestMetadata): boolean {
+    const idx = this.data.media.findIndex((m) => m.id === id);
+    if (idx === -1) return false;
+
+    const media = this.data.media[idx];
+    media.isDeleted = false;
+    media.deletedAt = undefined;
+    media.deletedBy = undefined;
+
+    this.save();
+    if (user) {
+      this.recordAuditLog(user, 'Alteração', 'Photos', media.title || media.originalName, `Mídia "${media.originalName}" restaurada da Lixeira`, meta);
+    }
+    return true;
+  }
+
+  public bulkRestoreMedia(ids: string[], user?: User, meta?: RequestMetadata): MediaAsset[] {
+    const idSet = new Set(ids);
+    const restored: MediaAsset[] = [];
+
+    this.data.media = this.data.media.map((item) => {
+      if (idSet.has(item.id)) {
+        const newItem = {
+          ...item,
+          isDeleted: false,
+          deletedAt: undefined,
+          deletedBy: undefined,
+        };
+        restored.push(newItem);
+        return newItem;
+      }
+      return item;
+    });
+
+    this.save();
+    if (user && restored.length > 0) {
+      this.recordAuditLog(user, 'Alteração', 'Photos', `${restored.length} mídias`, `${restored.length} mídias restauradas da Lixeira`, meta);
+    }
+    return restored;
+  }
+
+  public permanentDeleteMedia(id: string, user?: User, meta?: RequestMetadata): boolean {
+    const idx = this.data.media.findIndex((m) => m.id === id);
+    if (idx === -1) return false;
+
+    const media = this.data.media[idx];
+    this.data.media.splice(idx, 1);
+    this.save();
+
+    if (user) {
+      this.recordAuditLog(user, 'Exclusão', 'Photos', media.title || media.originalName, `Mídia "${media.originalName}" excluída permanentemente`, meta);
+    }
+    return true;
+  }
+
+  public getTrashedMedia(): MediaAsset[] {
+    return this.data.media.filter((m) => m.isDeleted);
+  }
+
+  // --- USAGE DETAILED CHECK ---
+  public getMediaUsageLocations(asset: MediaAsset): MediaUsageLocation[] {
+    const locations: MediaUsageLocation[] = [];
+    const url = asset.url;
+    const filename = asset.filename;
+    const id = asset.id;
+
+    const matchesUrlOrName = (str?: string) => {
+      if (!str) return false;
+      return (url && str.includes(url)) || (filename && str.includes(filename)) || (id && str.includes(id));
+    };
+
+    // 1. Settings / Home / Header
+    if (this.data.settings) {
+      const s = this.data.settings;
+      if (matchesUrlOrName(s.heroBgImage)) {
+        locations.push({ module: 'Home / Navegação', entityTitle: 'Header / Sessão Hero Principal', field: 'Imagem de Fundo Hero', pageUrl: '/' });
+      }
+    }
+
+    // 2. Ambassadors
+    if (this.data.ambassadors) {
+      for (const amb of this.data.ambassadors) {
+        if (matchesUrlOrName(amb.photo)) {
+          locations.push({ module: 'Embaixadores', entityId: amb.id, entityTitle: `Embaixador ${amb.fullName || amb.name}`, field: 'Foto Pública de Perfil', pageUrl: '/ambassadors' });
+        }
+      }
+    }
+
+    // 3. Programs
+    if (this.data.programs) {
+      for (const prog of this.data.programs) {
+        if (matchesUrlOrName(prog.featuredImage)) {
+          locations.push({ module: 'Programas', entityId: prog.id, entityTitle: `Programa: ${prog.title}`, field: 'Imagem Principal do Card', pageUrl: '/programs' });
+        }
+        if (matchesUrlOrName(prog.heroImage)) {
+          locations.push({ module: 'Programas', entityId: prog.id, entityTitle: `Programa: ${prog.title}`, field: 'Imagem Hero', pageUrl: '/programs' });
+        }
+        if (Array.isArray(prog.gallery)) {
+          for (const gUrl of prog.gallery) {
+            if (matchesUrlOrName(gUrl)) {
+              locations.push({ module: 'Programas', entityId: prog.id, entityTitle: `Programa: ${prog.title}`, field: 'Galeria de Fotos', pageUrl: '/programs' });
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // 4. Stories / News
+    if (this.data.stories) {
+      for (const story of this.data.stories) {
+        if (matchesUrlOrName(story.featuredPhoto)) {
+          locations.push({ module: 'Notícias', entityId: story.id, entityTitle: `Notícia: ${story.headline || story.title}`, field: 'Capa Principal da Notícia', pageUrl: '/news' });
+        }
+        if (matchesUrlOrName(story.heroImage)) {
+          locations.push({ module: 'Notícias', entityId: story.id, entityTitle: `Notícia: ${story.headline || story.title}`, field: 'Imagem Hero', pageUrl: '/news' });
+        }
+        if (matchesUrlOrName(story.fullText)) {
+          locations.push({ module: 'Notícias', entityId: story.id, entityTitle: `Notícia: ${story.headline || story.title}`, field: 'Imagem no Corpo do Texto', pageUrl: '/news' });
+        }
+        if (Array.isArray(story.photoGallery)) {
+          for (const gUrl of story.photoGallery) {
+            if (matchesUrlOrName(gUrl)) {
+              locations.push({ module: 'Notícias', entityId: story.id, entityTitle: `Notícia: ${story.headline || story.title}`, field: 'Galeria de Fotos', pageUrl: '/news' });
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // 5. Albums
+    if (this.data.albums) {
+      for (const alb of this.data.albums) {
+        if (matchesUrlOrName(alb.coverUrl) || alb.coverMediaId === id) {
+          locations.push({ module: 'Galeria', entityId: alb.id, entityTitle: `Álbum: ${alb.title}`, field: 'Capa do Álbum', pageUrl: '/media' });
+        }
+        if (asset.albumId === alb.id) {
+          locations.push({ module: 'Galeria', entityId: alb.id, entityTitle: `Álbum: ${alb.title}`, field: 'Foto do Álbum', pageUrl: '/media' });
+        }
+      }
+    }
+
+    return locations;
+  }
+
+  // --- REFERENCE REPLACEMENT & CONSOLIDATION ---
+  public replaceMediaReferences(
+    sourceAsset: MediaAsset,
+    targetAsset: MediaAsset,
+    user?: User,
+    meta?: RequestMetadata
+  ): number {
+    let updatedCount = 0;
+    const sourceUrl = sourceAsset.url;
+    const targetUrl = targetAsset.url;
+    const sourceId = sourceAsset.id;
+    const targetId = targetAsset.id;
+    const sourceFilename = sourceAsset.filename;
+
+    if (!sourceUrl || !targetUrl || sourceUrl === targetUrl) return 0;
+
+    const replaceStr = (str?: string): { newStr: string; changed: boolean } => {
+      if (!str) return { newStr: '', changed: false };
+      let changed = false;
+      let newStr = str;
+      if (newStr.includes(sourceUrl)) {
+        newStr = newStr.replaceAll(sourceUrl, targetUrl);
+        changed = true;
+      }
+      if (sourceFilename && newStr.includes(sourceFilename)) {
+        newStr = newStr.replaceAll(sourceFilename, targetAsset.filename);
+        changed = true;
+      }
+      return { newStr, changed };
+    };
+
+    // 1. Settings
+    if (this.data.settings) {
+      const s = this.data.settings;
+      if (s.heroBgImage) {
+        const { newStr, changed } = replaceStr(s.heroBgImage);
+        if (changed) { s.heroBgImage = newStr; updatedCount++; }
+      }
+    }
+
+    // 2. Ambassadors
+    if (this.data.ambassadors) {
+      for (const amb of this.data.ambassadors) {
+        if (amb.photo) {
+          const { newStr, changed } = replaceStr(amb.photo);
+          if (changed) { amb.photo = newStr; updatedCount++; }
+        }
+      }
+    }
+
+    // 3. Programs
+    if (this.data.programs) {
+      for (const prog of this.data.programs) {
+        if (prog.featuredImage) {
+          const { newStr, changed } = replaceStr(prog.featuredImage);
+          if (changed) { prog.featuredImage = newStr; updatedCount++; }
+        }
+        if (prog.heroImage) {
+          const { newStr, changed } = replaceStr(prog.heroImage);
+          if (changed) { prog.heroImage = newStr; updatedCount++; }
+        }
+        if (Array.isArray(prog.gallery) && prog.gallery.length > 0) {
+          let galChanged = false;
+          prog.gallery = prog.gallery.map((gUrl) => {
+            const { newStr, changed } = replaceStr(gUrl);
+            if (changed) galChanged = true;
+            return newStr;
+          });
+          if (galChanged) updatedCount++;
+        }
+        if (prog.fullDescription) {
+          const { newStr, changed } = replaceStr(prog.fullDescription);
+          if (changed) { prog.fullDescription = newStr; updatedCount++; }
+        }
+      }
+    }
+
+    // 4. Stories
+    if (this.data.stories) {
+      for (const story of this.data.stories) {
+        if (story.featuredPhoto) {
+          const { newStr, changed } = replaceStr(story.featuredPhoto);
+          if (changed) { story.featuredPhoto = newStr; updatedCount++; }
+        }
+        if (story.heroImage) {
+          const { newStr, changed } = replaceStr(story.heroImage);
+          if (changed) { story.heroImage = newStr; updatedCount++; }
+        }
+        if (story.fullText) {
+          const { newStr, changed } = replaceStr(story.fullText);
+          if (changed) { story.fullText = newStr; updatedCount++; }
+        }
+        if (Array.isArray(story.photoGallery) && story.photoGallery.length > 0) {
+          let galChanged = false;
+          story.photoGallery = story.photoGallery.map((gUrl) => {
+            const { newStr, changed } = replaceStr(gUrl);
+            if (changed) galChanged = true;
+            return newStr;
+          });
+          if (galChanged) updatedCount++;
+        }
+      }
+    }
+
+    // 5. Albums
+    if (this.data.albums) {
+      for (const alb of this.data.albums) {
+        if (alb.coverUrl) {
+          const { newStr, changed } = replaceStr(alb.coverUrl);
+          if (changed) { alb.coverUrl = newStr; updatedCount++; }
+        }
+        if (alb.coverMediaId === sourceId) {
+          alb.coverMediaId = targetId;
+          updatedCount++;
+        }
+      }
+    }
+
+    this.save();
+    return updatedCount;
+  }
+
+  /**
+   * Dry run of consolidation to see what will be changed
+   */
+  public consolidateMediaDryRun(masterMediaId: string, targetMediaIds: string[]): {
+    master: MediaAsset;
+    targets: {
+      id: string;
+      originalName: string;
+      usages: { module: string; field: string; entityTitle?: string }[];
+    }[];
+    totalChanges: number;
+  } {
+    const master = this.data.media.find((m) => m.id === masterMediaId);
+    if (!master) throw new Error('Mídia Mestre não encontrada');
+
+    const result = {
+      master,
+      targets: [] as any[],
+      totalChanges: 0
+    };
+
+    for (const targetId of targetMediaIds) {
+      const target = this.data.media.find((m) => m.id === targetId);
+      if (!target) continue;
+
+      const usages = this.getMediaUsageLocations(target);
+      result.targets.push({
+        id: target.id,
+        originalName: target.originalName,
+        usages
+      });
+      result.totalChanges += usages.length;
+    }
+
+    return result;
+  }
+
+  public consolidateMedia(
+    masterMediaId: string,
+    targetMediaIds: string[],
+    user?: User,
+    meta?: RequestMetadata
+  ): { success: boolean; masterMedia: MediaAsset; updatedReferencesCount: number; message: string } {
+    const master = this.data.media.find((m) => m.id === masterMediaId);
+    if (!master) throw new Error('Mídia mestre não encontrada.');
+
+    let totalUpdatedRefs = 0;
+    const consolidatedIds: string[] = [];
+
+    for (const tid of targetMediaIds) {
+      if (tid === masterMediaId) continue;
+      const target = this.data.media.find((m) => m.id === tid);
+      if (!target || target.isDeleted) continue;
+
+      // 1. Migrate References
+      const refsCount = this.replaceMediaReferences(target, master, user, meta);
+      totalUpdatedRefs += refsCount;
+
+      // 2. Mark as consolidated and move to Trash
+      target.duplicateStatus = 'confirmed_duplicate';
+      target.duplicateOfId = masterMediaId;
+      
+      // Perform real soft-delete
+      this.softDeleteMedia(target.id, user, {
+        ...meta,
+        reason: `Consolidado no arquivo mestre ${masterMediaId}`
+      } as any);
+      
+      consolidatedIds.push(tid);
+    }
+
+    master.duplicateStatus = 'keep_both';
+
+    // 3. Remove from DuplicateGroups
+    if (this.data.duplicateGroups) {
+      this.data.duplicateGroups = this.data.duplicateGroups.filter((g) => {
+        const hasTarget = g.mediaIds.some((id) => consolidatedIds.includes(id));
+        if (hasTarget) {
+          g.mediaIds = g.mediaIds.filter((id) => !consolidatedIds.includes(id));
+          if (g.mediaIds.length <= 1) return false;
+        }
+        return true;
+      });
+    }
+
+    this.save();
+
+    if (user) {
+      this.recordAuditLog(
+        user,
+        'Consolidação de Mídia' as any,
+        'Photos',
+        master.title || master.originalName,
+        `Consolidação concluída: ${consolidatedIds.length} arquivo(s) redundantes migrados e movidos para a Lixeira. ${totalUpdatedRefs} referência(s) atualizada(s) para o mestre "${master.originalName}".`,
+        meta
+      );
+    }
+
+    return {
+      success: true,
+      masterMedia: master,
+      updatedReferencesCount: totalUpdatedRefs,
+      message: `Consolidação realizada com sucesso. ${totalUpdatedRefs} referência(s) migrada(s) para o arquivo mestre "${master.originalName}".`,
+    };
+  }
+
+  public checkDeleteSafety(mediaIds: string[]): {
+    totalSelected: number;
+    unusedCount: number;
+    usedCount: number;
+    unknownCount: number;
+    safeToDeleteIds: string[];
+    blockedItems: { id: string; name: string; usageCount: number; locations: MediaUsageLocation[] }[];
+  } {
+    const safeToDeleteIds: string[] = [];
+    const blockedItems: { id: string; name: string; usageCount: number; locations: MediaUsageLocation[] }[] = [];
+    let unusedCount = 0;
+    let usedCount = 0;
+    let unknownCount = 0;
+
+    for (const id of mediaIds) {
+      const media = this.data.media.find((m) => m.id === id);
+      if (!media) {
+        unknownCount++;
+        continue;
+      }
+
+      const locations = this.getMediaUsageLocations(media);
+      if (locations.length === 0) {
+        unusedCount++;
+        safeToDeleteIds.push(id);
+      } else {
+        usedCount++;
+        blockedItems.push({
+          id: media.id,
+          name: media.originalName || media.filename,
+          usageCount: locations.length,
+          locations,
+        });
+      }
+    }
+
+    return {
+      totalSelected: mediaIds.length,
+      unusedCount,
+      usedCount,
+      unknownCount,
+      safeToDeleteIds,
+      blockedItems,
+    };
+  }
+
+  public createTestDuplicateScenario(user?: User, meta?: RequestMetadata): {
+    message: string;
+    mediaA: MediaAsset;
+    mediaB: MediaAsset;
+    mediaC: MediaAsset;
+  } {
+    const now = new Date().toISOString();
+    const sharedSha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+    const sharedUrl = 'https://picsum.photos/id/1050/800/600';
+
+    const mediaA: MediaAsset = {
+      id: `test_dup_a_${Date.now()}`,
+      filename: 'logo-admir-header.webp',
+      originalName: 'logo-admir-header.webp',
+      organizedName: 'ADMIR_Logo_Header_001',
+      title: 'Logotipo Header Oficial',
+      url: sharedUrl,
+      thumbUrl: sharedUrl,
+      mimeType: 'image/webp',
+      sizeBytes: 45200,
+      fileSize: '45.2 KB',
+      dimensions: '800x600',
+      altText: 'ADMIR Logo Header',
+      caption: 'Logotipo utilizado no topo do site',
+      tags: ['logo', 'header', 'oficial'],
+      createdAt: now,
+      sha256: sharedSha256,
+      category: 'LOGO',
+    };
+
+    const mediaB: MediaAsset = {
+      id: `test_dup_b_${Date.now()}`,
+      filename: 'brasao-admir-oficial.webp',
+      originalName: 'brasao-admir-oficial.webp',
+      organizedName: 'ADMIR_Brasao_Oficial_002',
+      title: 'Brasão Diplomático ADMIR',
+      url: sharedUrl,
+      thumbUrl: sharedUrl,
+      mimeType: 'image/webp',
+      sizeBytes: 45200,
+      fileSize: '45.2 KB',
+      dimensions: '800x600',
+      altText: 'Brasão Diplomático ADMIR',
+      caption: 'Brasão oficial para selos e documentos',
+      tags: ['brasao', 'selo', 'diplomatico'],
+      createdAt: now,
+      sha256: sharedSha256,
+      category: 'BRASÃO / SELO',
+    };
+
+    const mediaC: MediaAsset = {
+      id: `test_dup_c_${Date.now()}`,
+      filename: 'logo-admir-copia-nao-utilizada.webp',
+      originalName: 'logo-admir-copia-nao-utilizada.webp',
+      organizedName: 'ADMIR_Logo_Copia_003',
+      title: 'Cópia Antiga Sem Uso',
+      url: sharedUrl,
+      thumbUrl: sharedUrl,
+      mimeType: 'image/webp',
+      sizeBytes: 45200,
+      fileSize: '45.2 KB',
+      dimensions: '800x600',
+      altText: 'Cópia não utilizada',
+      caption: 'Arquivo duplicado armazenado no acervo',
+      tags: ['duplicado', 'rascunho'],
+      createdAt: now,
+      sha256: sharedSha256,
+      category: 'OUTROS',
+    };
+
+    this.data.media.unshift(mediaA, mediaB, mediaC);
+
+    if (this.data.settings) {
+      this.data.settings.heroBgImage = mediaA.url;
+    }
+
+    if (this.data.ambassadors && this.data.ambassadors.length > 0) {
+      this.data.ambassadors[0].photo = mediaB.url;
+    }
+
+    this.save();
+    this.scanLibraryForDuplicates(user, meta);
+
+    return {
+      message: 'Cenário de teste de duplicidades criado com sucesso! A (Header - em uso), B (Brasão - em uso) e C (Não utilizada).',
+      mediaA,
+      mediaB,
+      mediaC,
+    };
+  }
+
+  // --- NAMING CONFIG & ACERVO ANALYSIS ---
+  public getNamingConfig(): NamingConfig {
+    if (!this.data.namingConfig) {
+      this.data.namingConfig = DEFAULT_NAMING_CONFIG;
+    }
+    return this.data.namingConfig;
+  }
+
+  public saveNamingConfig(config: NamingConfig, user?: User, meta?: RequestMetadata): NamingConfig {
+    this.data.namingConfig = config;
+    this.save();
+    if (user) {
+      this.recordAuditLog(user, 'Alteração', 'Photos', 'Configurações de Nomenclatura', 'Padrões de nomenclatura da biblioteca de mídia atualizados', meta);
+    }
+    return this.data.namingConfig;
+  }
+
+  public analyzeCurrentAcervo(): AcervoDiagnosticReport {
+    const activeMedia = this.getMedia(false); // non-deleted media
+    const categoryCounts: Record<string, number> = {};
+    let unclassifiedCount = 0;
+
+    const config = this.getNamingConfig();
+    const renamePreviews: AcervoDiagnosticReport['renamePreviews'] = [];
+
+    const categorySequences: Record<string, number> = {};
+
+    for (const asset of activeMedia) {
+      const cat: MediaCategory = asset.category || 'NÃO CLASSIFICADO';
+      categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
+      if (cat === 'NÃO CLASSIFICADO') unclassifiedCount++;
+
+      categorySequences[cat] = (categorySequences[cat] || 0) + 1;
+      const seq = categorySequences[cat];
+
+      const suggestedName = generateOrganizedName(asset, seq, config);
+
+      renamePreviews.push({
+        assetId: asset.id,
+        originalName: asset.originalName || asset.filename,
+        currentName: asset.organizedName || asset.filename,
+        suggestedOrganizedName: suggestedName,
+        category: cat,
+        status: cat === 'NÃO CLASSIFICADO' ? 'needs_info' : 'ready',
+      });
+    }
+
+    const dupScan = this.scanLibraryForDuplicates();
+
+    return {
+      totalScanned: activeMedia.length,
+      categoryCounts,
+      duplicateGroupsCount: dupScan.newGroupsCount || dupScan.groups.length,
+      unclassifiedCount,
+      renamePreviewCount: renamePreviews.length,
+      renamePreviews,
+      duplicateGroups: dupScan.groups,
+    };
+  }
+
+  public applyBatchRename(
+    renames: { assetId: string; newOrganizedName: string }[],
+    user: User,
+    meta?: RequestMetadata
+  ): number {
+    let count = 0;
+    const renameMap = new Map(renames.map((r) => [r.assetId, r.newOrganizedName]));
+
+    this.data.media = this.data.media.map((asset) => {
+      if (renameMap.has(asset.id)) {
+        const newName = renameMap.get(asset.id)!;
+        count++;
+        return {
+          ...asset,
+          organizedName: newName,
+          displayName: newName,
+        };
+      }
+      return asset;
+    });
+
+    this.save();
+    if (user) {
+      this.recordAuditLog(
+        user,
+        'Edição em Massa',
+        'Photos',
+        'Padronização de Nomenclatura',
+        `${count} mídias tiveram nomenclatura padronizada sem alterar URLs ou storageKeys físicas do Cloudflare R2.`,
+        meta
+      );
+    }
+    return count;
+  }
+
+  public approveAISuggestions(
+    assetId: string,
+    overrides?: Partial<MediaAsset>,
+    user?: User,
+    meta?: RequestMetadata
+  ): MediaAsset {
+    const idx = this.data.media.findIndex((m) => m.id === assetId);
+    if (idx === -1) throw new Error('Mídia não encontrada');
+
+    const asset = this.data.media[idx];
+    const sug = asset.aiSuggestions;
+
+    const updatedCategory = (overrides?.category || sug?.category || asset.category || 'NÃO CLASSIFICADO') as MediaCategory;
+    const updatedTitle = overrides?.title || sug?.suggestedTitle || asset.title;
+    const updatedDesc = overrides?.description || sug?.suggestedDescription || asset.description;
+    const updatedTags = overrides?.tags || (sug?.tags ? Array.from(new Set([...asset.tags, ...sug.tags])) : asset.tags);
+
+    const updatedAsset: MediaAsset = {
+      ...asset,
+      category: updatedCategory,
+      title: updatedTitle,
+      description: updatedDesc,
+      tags: updatedTags,
+      aiSuggestions: sug ? { ...sug, status: 'approved' } : undefined,
+    };
+
+    if (!updatedAsset.organizedName) {
+      const config = this.getNamingConfig();
+      const sameCatCount = this.data.media.filter((m) => m.category === updatedCategory).length + 1;
+      updatedAsset.organizedName = generateOrganizedName(updatedAsset, sameCatCount, config);
+      updatedAsset.displayName = updatedAsset.organizedName;
+    }
+
+    this.data.media[idx] = updatedAsset;
+    this.save();
+
+    if (user) {
+      this.recordAuditLog(
+        user,
+        'Alteração',
+        'Photos',
+        asset.originalName,
+        `Sugestões da IA aprovadas para a mídia "${asset.originalName}". Categoria: ${updatedCategory}`,
+        meta
+      );
+    }
+
+    return updatedAsset;
   }
 
   // --- DONATIONS ---
@@ -3186,6 +4470,40 @@ Endereço Sede: ${settings.footerAddress || 'Washington, D.C. - Estados Unidos'}
     );
 
     return JSON.parse(JSON.stringify(this.data.maintenanceSettings));
+  }
+
+  // --- MEDIA AI ORGANIZATION & CLUSTERING ---
+
+  public getAIClusterProposals(): AIClusterGroup[] {
+    return this.data.aiClusterProposals || [];
+  }
+
+  public setAIClusterProposals(clusters: AIClusterGroup[]): void {
+    this.data.aiClusterProposals = clusters;
+    this.save();
+  }
+
+  public updateAIClusterProposal(id: string, updates: Partial<AIClusterGroup>): AIClusterGroup {
+    if (!this.data.aiClusterProposals) this.data.aiClusterProposals = [];
+    const idx = this.data.aiClusterProposals.findIndex((c) => c.id === id);
+    if (idx === -1) throw new Error('Proposal not found');
+
+    this.data.aiClusterProposals[idx] = {
+      ...this.data.aiClusterProposals[idx],
+      ...updates,
+      status: updates.status || 'MODIFIED',
+    };
+    this.save();
+    return this.data.aiClusterProposals[idx];
+  }
+
+  public deleteAIClusterProposal(id: string): boolean {
+    if (!this.data.aiClusterProposals) return false;
+    const initialLen = this.data.aiClusterProposals.length;
+    this.data.aiClusterProposals = this.data.aiClusterProposals.filter((c) => c.id !== id);
+    const deleted = this.data.aiClusterProposals.length < initialLen;
+    if (deleted) this.save();
+    return deleted;
   }
 }
 

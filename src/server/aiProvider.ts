@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { withAIRetry, getSharedGenAI, GEMINI_MODEL } from './aiUtils';
 
 export interface AIProviderChatOptions {
   message: string;
@@ -22,7 +22,7 @@ export interface AIProvider {
 }
 
 export class GeminiProvider implements AIProvider {
-  public name = 'Google Gemini (gemini-3.8-flash)';
+  public name = `Google Gemini (${GEMINI_MODEL})`;
 
   public async generateChatResponse(options: AIProviderChatOptions): Promise<AIProviderChatResult> {
     const { message, context, language, history = [] } = options;
@@ -50,9 +50,9 @@ export class GeminiProvider implements AIProvider {
       };
     }
 
-    const apiKey = process.env.GEMINI_API_KEY;
+    const ai = getSharedGenAI();
 
-    if (!apiKey) {
+    if (!ai) {
       // Fallback when no Gemini API key is supplied in environment
       const fallbackNoKeyMap: Record<string, string> = {
         pt: 'Não encontrei essa informação na base pública da ADMIR no momento. Se desejar, posso encaminhar sua solicitação para a nossa equipe de atendimento.',
@@ -67,15 +67,6 @@ export class GeminiProvider implements AIProvider {
     }
 
     try {
-      const ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          },
-        },
-      });
-
       const langInstructions: Record<string, string> = {
         pt: 'Responda sempre em Português (PT-BR).',
         en: 'Always answer in English.',
@@ -110,57 +101,19 @@ ${context || 'Nenhuma informação específica encontrada na base pública.'}`;
         parts: [{ text: message }],
       });
 
-      const modelsToTry = ['gemini-3.5-flash', 'gemini-3.6-flash'];
-      let response;
-      let lastError: any;
-
-      const isRecuperavel = (err: any) => {
-        if (!err) return false;
-        const status = err.status || err.statusCode || (err.error && err.error.code);
-        if (status === 503 || status === 429) {
-          return true;
-        }
-        const msg = String(err.message || err.stack || err).toLowerCase();
-        return (
-          msg.includes('503') ||
-          msg.includes('429') ||
-          msg.includes('unavailable') ||
-          msg.includes('overloaded') ||
-          msg.includes('experiencing high demand') ||
-          msg.includes('limit') ||
-          msg.includes('quota') ||
-          msg.includes('resource_exhausted') ||
-          msg.includes('service unavailable')
-        );
-      };
-
-      for (const modelName of modelsToTry) {
-        try {
-          response = await ai.models.generateContent({
-            model: modelName,
-            contents: formattedContents,
-            config: {
-              systemInstruction: systemPrompt,
-              temperature: 0.2, // Low temperature for high fidelity / low hallucination
-            },
-          });
-          if (response) {
-            break;
-          }
-        } catch (modelErr: any) {
-          console.warn(`[GeminiProvider Warning]: Model ${modelName} failed.`, modelErr);
-          lastError = modelErr;
-          
-          // Stop immediately and throw if the error is NOT temporary/recoverable (e.g. 400, 401, 403, missing key)
-          if (!isRecuperavel(modelErr)) {
-            console.error(`[GeminiProvider Critical]: Unrecoverable error encountered using ${modelName}. Stopping fallback loop.`);
-            throw modelErr;
-          }
-        }
-      }
+      const response = await withAIRetry(async () => {
+        return await ai.models.generateContent({
+          model: GEMINI_MODEL,
+          contents: formattedContents,
+          config: {
+            systemInstruction: systemPrompt,
+            temperature: 0.2, // Low temperature for high fidelity / low hallucination
+          },
+        });
+      }, 'GeminiChat');
 
       if (!response) {
-        throw lastError || new Error('All attempt models failed to respond.');
+        throw new Error('Model failed to respond after retries.');
       }
 
       const answerText = (response.text || '').trim();

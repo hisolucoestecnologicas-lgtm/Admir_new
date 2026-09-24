@@ -37,7 +37,15 @@ export const ALL_PERMISSIONS_KEYS: (keyof GranularPermissions)[] = [
 
   'media.view',
   'media.upload',
+  'media.bulk_upload',
   'media.edit_metadata',
+  'media.bulk_edit',
+  'media.manage_albums',
+  'media.ai_organize',
+  'media.ai_review',
+  'media.review_duplicates',
+  'media.delete_duplicates',
+  'media.restore_deleted',
   'media.copy_url',
   'media.delete',
 
@@ -116,7 +124,15 @@ export function getPresetPermissions(preset: 'all' | 'none' | 'readonly' | 'edit
 
     'media.view': false,
     'media.upload': false,
+    'media.bulk_upload': false,
     'media.edit_metadata': false,
+    'media.bulk_edit': false,
+    'media.manage_albums': false,
+    'media.ai_organize': false,
+    'media.ai_review': false,
+    'media.review_duplicates': false,
+    'media.delete_duplicates': false,
+    'media.restore_deleted': false,
     'media.copy_url': false,
     'media.delete': false,
 
@@ -211,7 +227,12 @@ export function getPresetPermissions(preset: 'all' | 'none' | 'readonly' | 'edit
 
     base['media.view'] = true;
     base['media.upload'] = true;
+    base['media.bulk_upload'] = true;
     base['media.edit_metadata'] = true;
+    base['media.bulk_edit'] = true;
+    base['media.manage_albums'] = true;
+    base['media.ai_organize'] = true;
+    base['media.ai_review'] = true;
     base['media.copy_url'] = true;
 
     base['tasks.view'] = true;
@@ -326,7 +347,15 @@ export const PERMISSION_SECTIONS: PermissionSection[] = [
     permissions: [
       { key: 'media.view', label: 'Visualizar biblioteca de mídia' },
       { key: 'media.upload', label: 'Fazer upload de fotos e mídias' },
+      { key: 'media.bulk_upload', label: 'Fazer upload em massa e pacotes ZIP' },
       { key: 'media.edit_metadata', label: 'Editar alt text, legenda e tags' },
+      { key: 'media.bulk_edit', label: 'Edição em massa de metadados' },
+      { key: 'media.manage_albums', label: 'Gerenciar álbuns e eventos' },
+      { key: 'media.ai_organize', label: 'Organização inteligente com IA Gemini' },
+      { key: 'media.ai_review', label: 'Revisar sugestões de álbuns da IA' },
+      { key: 'media.review_duplicates', label: 'Revisar duplicidades detectadas' },
+      { key: 'media.delete_duplicates', label: 'Confirmar exclusão de duplicatas (Lixeira)' },
+      { key: 'media.restore_deleted', label: 'Restaurar mídias da lixeira' },
       { key: 'media.copy_url', label: 'Copiar link de mídia' },
       { key: 'media.delete', label: 'Excluir mídia do acervo' },
     ],

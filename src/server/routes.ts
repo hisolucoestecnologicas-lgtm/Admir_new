@@ -8,6 +8,8 @@ import { PublicMediaStorage } from './storage';
 import { PrivateDocumentStorage } from './privateStorage';
 import { GranularPermissions, User } from '../types';
 import { defaultAIProvider } from './aiProvider';
+import { analyzeImageWithGemini, clusterMediaAssetsWithGemini } from './aiMediaService';
+import { processArchiveUpload, runArchiveImportWorker } from './archiveProcessor';
 import { communicationChannels } from './communicationChannels';
 import { syncService } from './syncService';
 import {
@@ -15,6 +17,8 @@ import {
   getPrivateDocumentFromFirestore,
   deletePrivateDocumentFromFirestore,
 } from './firebaseStore';
+
+import { withAIRetry, getSharedGenAI, GEMINI_MODEL, AI_ANALYSIS_VERSION } from './aiUtils';
 
 export const apiRouter = express.Router();
 
@@ -1060,7 +1064,11 @@ apiRouter.post('/ambassadors/generate-bio', requirePermission('ambassadors.edit'
       });
     }
 
-    const ai = new GoogleGenAI({ apiKey: key });
+    const ai = getSharedGenAI();
+    if (!ai) {
+      return res.status(503).json({ error: 'Configuração de IA indisponível no servidor.' });
+    }
+
     const prompt = `Você é um redator institucional especializado da ADMIR (American Diplomatic Mission of International Relations).
 Sua tarefa é elaborar uma SUGESTÃO curta e diplomática de biografia em 3 idiomas (Português, Inglês e Espanhol) para o perfil público do embaixador.
 
@@ -1081,53 +1089,15 @@ REGRAS ESTRITAS DE REVISÃO E FIELIDADE:
   "bio_es": "biografía en español..."
 }`;
 
-    const modelsToTry = ['gemini-3.5-flash', 'gemini-3.6-flash'];
-    let response;
-    let lastError: any;
-
-    const isRecuperavel = (err: any) => {
-      if (!err) return false;
-      const status = err.status || err.statusCode || (err.error && err.error.code);
-      if (status === 503 || status === 429) {
-        return true;
-      }
-      const msg = String(err.message || err.stack || err).toLowerCase();
-      return (
-        msg.includes('503') ||
-        msg.includes('429') ||
-        msg.includes('unavailable') ||
-        msg.includes('overloaded') ||
-        msg.includes('experiencing high demand') ||
-        msg.includes('limit') ||
-        msg.includes('quota') ||
-        msg.includes('resource_exhausted') ||
-        msg.includes('service unavailable')
-      );
-    };
-
-    for (const modelName of modelsToTry) {
-      try {
-        response = await ai.models.generateContent({
-          model: modelName,
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-          }
-        });
-        if (response) {
-          break;
+    const response = await withAIRetry(async () => {
+      return await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        config: {
+          responseMimeType: 'application/json',
         }
-      } catch (err: any) {
-        console.warn(`[AI Suggestion Warning]: Model ${modelName} failed.`, err);
-        lastError = err;
-
-        // Stop immediately if error is unrecoverable (e.g. 400, 401, 403, missing key)
-        if (!isRecuperavel(err)) {
-          console.error(`[AI Suggestion Critical]: Unrecoverable error using ${modelName}. Stopping fallback loop.`);
-          throw err;
-        }
-      }
-    }
+      });
+    }, 'AmbassadorBio');
 
     if (!response) {
       return res.status(503).json({ 
@@ -1291,8 +1261,24 @@ apiRouter.put('/media/:id', requirePermission('media.edit_metadata'), (req: Auth
 
 apiRouter.delete('/media/:id', requirePermission('media.delete'), async (req: AuthenticatedRequest, res) => {
   try {
+    const force = req.query.force === 'true' || req.body?.force === true;
     const mediaList = db.getMedia();
     const item = mediaList.find((m) => m.id === req.params.id);
+
+    if (!item) {
+      return res.status(404).json({ error: 'Mídia não encontrada.' });
+    }
+
+    if (!force) {
+      const locations = db.getMediaUsageLocations(item);
+      if (locations.length > 0) {
+        return res.status(400).json({
+          error: `Mídia em uso em ${locations.length} local(is). Não pode ser excluída sem consolidação prévia.`,
+          isReferenced: true,
+          locations,
+        });
+      }
+    }
 
     if (item) {
       // If it's an R2 file, delete from R2 as well
@@ -1305,12 +1291,6 @@ apiRouter.delete('/media/:id', requirePermission('media.delete'), async (req: Au
         } catch (storageErr) {
           console.error('[MediaDelete] Failed to delete from R2 (non-fatal):', storageErr);
         }
-      } else {
-        // Legacy local file cleanup (optional, but good practice if we want to reclaim space)
-        // Note: The user said "NÃO migre os assets existentes", but didn't say not to delete them if requested.
-        // However, standard safety says don't touch filesystem if not explicitly told.
-        // But the previous implementation (in earlier turns probably) didn't even delete local files.
-        // Let's stick to R2 cleanup for now.
       }
     }
 
@@ -1319,6 +1299,828 @@ apiRouter.delete('/media/:id', requirePermission('media.delete'), async (req: Au
   } catch (err: any) {
     console.error('[MediaDelete] Error:', err);
     res.status(400).json({ error: err.message });
+  }
+});
+
+// Bulk Edit Metadata Endpoint
+apiRouter.post('/media/bulk-edit', requirePermission('media.bulk_edit'), (req: AuthenticatedRequest, res) => {
+  try {
+    const { ids, updates } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'Lista de IDs para atualização é obrigatória.' });
+    }
+    const updated = db.bulkUpdateMedia(ids, updates || {}, req.user!, getReqMeta(req));
+    res.json(updated);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Direct Binary Upload for Bulk Photos (avoiding Base64 JSON bloat)
+apiRouter.post('/media/upload-direct', requirePermission('media.bulk_upload'), express.raw({ type: ['image/*', 'application/octet-stream'], limit: '35mb' }), async (req: AuthenticatedRequest, res) => {
+  try {
+    const fileName = (req.headers['x-file-name'] as string) || `admir-${Date.now()}.jpg`;
+    const mimeType = (req.headers['x-mime-type'] as string) || 'image/jpeg';
+    const sha256 = (req.headers['x-sha256'] as string) || '';
+    const title = (req.headers['x-title'] as string) || fileName;
+    const albumId = (req.headers['x-album-id'] as string) || '';
+
+    if (!req.body || !(req.body instanceof Buffer) || req.body.length === 0) {
+      return res.status(400).json({ error: 'Conteúdo binário da imagem não fornecido.' });
+    }
+
+    const buffer = req.body as Buffer;
+
+    // 1. Deduplication check via SHA-256
+    if (sha256) {
+      const existing = db.findMediaBySha256(sha256);
+      if (existing) {
+        return res.status(200).json({
+          isDuplicate: true,
+          duplicateOfId: existing.id,
+          asset: existing,
+          message: `Imagem duplicada detectada (Hash SHA-256 idêntico ao ativo ${existing.id}).`
+        });
+      }
+    }
+
+    // 2. R2 Storage Upload
+    if (!PublicMediaStorage.isConfigured()) {
+      return res.status(503).json({ error: 'Cloudflare R2 não está configurado para armazenamento persistente.' });
+    }
+
+    const safeName = `${Date.now()}-${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    const objectKey = `public/media/${safeName}`;
+
+    const storageResult = await PublicMediaStorage.upload(objectKey, buffer, mimeType);
+
+    // 3. Register asset
+    const asset = db.addMedia(
+      {
+        filename: safeName,
+        originalName: fileName,
+        url: storageResult.url,
+        thumbUrl: storageResult.url, // R2 proxy serves compressed/optimized image
+        mimeType,
+        sizeBytes: buffer.length,
+        altText: title || 'Fotografia Institucional ADMIR',
+        caption: '',
+        tags: ['massa', 'importação'],
+        sha256,
+        albumId: albumId || undefined,
+        aiAnalyzed: false,
+      },
+      req.user!,
+      getReqMeta(req)
+    );
+
+    res.status(201).json({ isDuplicate: false, asset });
+  } catch (err: any) {
+    console.error('[DirectMediaUpload] Error:', err);
+    res.status(500).json({ error: err.message || 'Falha no upload binário direto' });
+  }
+});
+
+// Request secure session and presigned URL for direct archive upload to R2
+apiRouter.post('/media/request-archive-session', requirePermission('media.bulk_upload'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const { fileName, fileSize } = req.body;
+    if (!fileName) {
+      return res.status(400).json({ error: 'Nome do arquivo é obrigatório.' });
+    }
+
+    if (!PublicMediaStorage.isConfigured()) {
+      return res.status(503).json({ error: 'Cloudflare R2 não está configurado para armazenamento persistente.' });
+    }
+
+    const MAX_PACKAGE_SIZE = 500 * 1024 * 1024; // 500 MB
+    if (fileSize && fileSize > MAX_PACKAGE_SIZE) {
+      return res.status(400).json({ error: `O tamanho do pacote excede o limite de segurança de ${MAX_PACKAGE_SIZE / (1024 * 1024)} MB.` });
+    }
+
+    // Generate random secure temporary path in R2
+    const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const objectKey = `public/temp_archives/${Date.now()}-${Math.random().toString(36).substring(2, 8)}-${safeName}`;
+    
+    // Generate secure presigned PUT URL
+    const uploadUrl = await PublicMediaStorage.getPresignedPutUrl(objectKey, 'application/zip', 3600);
+
+    // Enforce dynamic bucket CORS rules on active origins
+    const requestOrigin = req.headers.origin || '';
+    await PublicMediaStorage.ensureBucketCors(requestOrigin);
+
+    res.json({
+      uploadUrl,
+      objectKey,
+    });
+  } catch (err: any) {
+    console.error('[RequestArchiveSession] Error:', err);
+    res.status(500).json({ error: err.message || 'Falha ao gerar sessão de upload direto para o R2' });
+  }
+});
+
+// Process the direct upload archive from R2
+apiRouter.post('/media/process-archive-session', requirePermission('media.bulk_upload'), async (req: AuthenticatedRequest, res) => {
+  const tempDiskPath = path.join(process.cwd(), 'data', 'temp_imports', `download-${Date.now()}-${Math.random().toString(36).substring(2, 6)}.zip`);
+  const { objectKey, fileName } = req.body;
+
+  if (!objectKey || !fileName) {
+    return res.status(400).json({ error: 'Object key e nome do arquivo são obrigatórios.' });
+  }
+
+  try {
+    console.log('[ARCHIVE TRACE 20] PROCESS_SESSION_START', { objectKey });
+    
+    if (!PublicMediaStorage.isConfigured()) {
+      return res.status(503).json({ error: 'Cloudflare R2 não está configurado.' });
+    }
+
+    // 1. Download file from R2 to local disk as stream (completely bypasses Cloud Run request body limits)
+    console.log('[ARCHIVE TRACE 21] DOWNLOADING_FROM_R2_START');
+    const { body } = await PublicMediaStorage.read(objectKey);
+    const fileStream = fs.createWriteStream(tempDiskPath);
+    
+    const { pipeline } = await import('stream/promises');
+    await pipeline(body, fileStream);
+    console.log('[ARCHIVE TRACE 22] DOWNLOADING_FROM_R2_COMPLETE', { size: fs.statSync(tempDiskPath).size });
+
+    // 2. Process the file from disk using the updated processArchiveUpload
+    const report = await processArchiveUpload(tempDiskPath, fileName, {
+      jobName: `Importação ZIP: ${fileName}`,
+      userName: req.user?.name || req.user?.email || 'Administrador',
+      userId: req.user?.id,
+    });
+
+    // 3. Clean up the temp archive from R2 to keep bucket clean
+    try {
+      await PublicMediaStorage.delete(objectKey);
+      console.log('[ARCHIVE TRACE 28] R2_TEMP_ARCHIVE_DELETED');
+    } catch (delErr) {
+      console.warn('[ProcessArchiveSession] Failed to delete temp archive from R2 (non-fatal):', delErr);
+    }
+
+    res.status(200).json(report);
+  } catch (err: any) {
+    console.error('[ProcessArchiveSession] Error:', err);
+    // Cleanup local temp file in case of failure
+    if (fs.existsSync(tempDiskPath)) {
+      try { fs.unlinkSync(tempDiskPath); } catch (_) {}
+    }
+    res.status(400).json({ error: err.message || 'Falha ao processar pacote compactado.' });
+  }
+});
+
+// Endpoint for chunked binary uploads of compressed archives (Bypasses Cloud Run payload limits and R2 CORS)
+apiRouter.post(
+  '/media/upload-archive-chunk',
+  requirePermission('media.bulk_upload'),
+  express.raw({ type: 'application/octet-stream', limit: '30mb' }),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const uploadId = req.headers['x-upload-id'] as string;
+      const chunkIndexStr = req.headers['x-chunk-index'] as string;
+      const chunkTotalStr = req.headers['x-chunk-total'] as string;
+      const fileNameEncoded = req.headers['x-file-name'] as string;
+
+      if (!uploadId || !chunkIndexStr || !chunkTotalStr || !fileNameEncoded) {
+        return res.status(400).json({ error: 'Parâmetros de controle de chunk ausentes nos cabeçalhos.' });
+      }
+
+      const chunkIndex = parseInt(chunkIndexStr, 10);
+      const chunkTotal = parseInt(chunkTotalStr, 10);
+      const fileName = decodeURIComponent(fileNameEncoded);
+
+      const tempDir = path.join(process.cwd(), 'data', 'temp_imports');
+      if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+      }
+
+      const tempDiskPath = path.join(tempDir, `chunked-${uploadId}.zip`);
+
+      console.log(`[CHUNK TRACE] Chunk ${chunkIndex + 1}/${chunkTotal} received for uploadId: ${uploadId}, size: ${req.body.length} bytes`);
+
+      // Write chunk to file: if chunkIndex is 0, we create/overwrite; otherwise, we append
+      if (chunkIndex === 0) {
+        fs.writeFileSync(tempDiskPath, req.body);
+      } else {
+        fs.appendFileSync(tempDiskPath, req.body);
+      }
+
+      // If this is the last chunk, process the complete file
+      if (chunkIndex === chunkTotal - 1) {
+        console.log(`[CHUNK TRACE COMPLETE] All ${chunkTotal} chunks received for ${fileName}. Assembled size: ${fs.statSync(tempDiskPath).size} bytes. Processing...`);
+
+        const report = await processArchiveUpload(tempDiskPath, fileName, {
+          jobName: `Importação ZIP: ${fileName}`,
+          userName: req.user?.name || req.user?.email || 'Administrador',
+          userId: req.user?.id,
+        });
+
+        return res.status(200).json(report);
+      }
+
+      return res.status(200).json({ success: true, message: `Chunk ${chunkIndex + 1}/${chunkTotal} salvo com sucesso.` });
+    } catch (err: any) {
+      console.error('[UploadArchiveChunk] Error:', err);
+      res.status(400).json({ error: err.message || 'Falha ao processar fatia do pacote compactado.' });
+    }
+  }
+);
+
+// Compressed Archive (.zip, .rar, .7z) Upload Endpoint
+apiRouter.post('/media/upload-archive', requirePermission('media.bulk_upload'), (req, res, next) => {
+  console.log('[ARCHIVE TRACE 20] REQUEST_RECEIVED');
+  console.log('[ARCHIVE TRACE 21] BODY_STREAM_START');
+  next();
+}, express.raw({ type: ['application/zip', 'application/x-zip-compressed', 'application/x-rar-compressed', 'application/x-7z-compressed', 'application/octet-stream'], limit: '500mb' }), async (req: AuthenticatedRequest, res) => {
+  try {
+    console.log('[ARCHIVE TRACE 22] BODY_RECEIVED');
+    const fileName = (req.headers['x-file-name'] as string) || `pacote-admir-${Date.now()}.zip`;
+    const decodedName = decodeURIComponent(fileName);
+
+    if (!req.body || !(req.body instanceof Buffer) || req.body.length === 0) {
+      console.log('[ARCHIVE TRACE ERROR] Stage: BODY_RECEIVED, Error: No body buffer');
+      return res.status(400).json({ error: 'Conteúdo do arquivo compactado não recebido.' });
+    }
+
+    const report = await processArchiveUpload(req.body as Buffer, decodedName, {
+      jobName: `Importação ZIP: ${decodedName}`,
+      userName: req.user?.name || req.user?.email || 'Administrador',
+      userId: req.user?.id,
+    });
+
+    res.status(200).json(report);
+  } catch (err: any) {
+    console.error('[ArchiveUpload] Error:', err);
+    console.log(`[ARCHIVE TRACE ERROR] Stage: PROCESS_ARCHIVE, Error: ${err.message}`);
+    res.status(400).json({ error: err.message || 'Falha ao processar arquivo compactado.' });
+  }
+});
+
+// Cancel Import Job Endpoint
+apiRouter.post('/media/import-jobs/:id/cancel', requirePermission('media.bulk_upload'), (req: AuthenticatedRequest, res) => {
+  try {
+    const job = db.getImportJob(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Sessão de importação não encontrada.' });
+
+    if (job.status === 'COMPLETED' || job.status === 'ERROR' || job.status === 'CANCELLED') {
+      return res.status(400).json({ error: 'Não é possível cancelar uma importação já finalizada.' });
+    }
+
+    db.updateImportJob(job.id, { status: 'CANCELLED' });
+
+    // Clean up temp file
+    const tempFilePath = path.join(process.cwd(), 'data', 'temp_imports', `${job.id}.zip`);
+    if (fs.existsSync(tempFilePath)) {
+      try {
+        fs.unlinkSync(tempFilePath);
+      } catch (err) {
+        console.warn(`[Cancel] Failed to delete temp file ${tempFilePath}:`, err);
+      }
+    }
+
+    res.json({ success: true, message: 'Processamento cancelado com sucesso.', job: db.getImportJob(job.id) });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Retry Import Job Endpoint
+apiRouter.post('/media/import-jobs/:id/retry', requirePermission('media.bulk_upload'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const job = db.getImportJob(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Sessão de importação não encontrada.' });
+
+    if (job.status !== 'ERROR' && job.status !== 'CANCELLED') {
+      return res.status(400).json({ error: 'Somente sessões com erro ou canceladas podem ser retomadas.' });
+    }
+
+    const tempFilePath = path.join(process.cwd(), 'data', 'temp_imports', `${job.id}.zip`);
+    if (!fs.existsSync(tempFilePath)) {
+      return res.status(410).json({ error: 'Arquivo do pacote ZIP original não disponível para retomada. Por favor, envie novamente.' });
+    }
+
+    // Reset status to PROCESSING and reset errors
+    db.updateImportJob(job.id, {
+      status: 'PROCESSING',
+    });
+
+    const systemUser = (req.user || {
+      id: 'admin-system',
+      email: 'admin@admiramerican.com',
+      name: 'Administrador',
+      role: 'owner',
+      status: 'active',
+      permissions: {} as any,
+    }) as any;
+
+    // Run background worker asynchronously
+    runArchiveImportWorker(job.id, tempFilePath, systemUser).catch((err) => {
+      console.error(`[BackgroundWorker] Retry Job ${job.id} failed:`, err);
+    });
+
+    res.json({ success: true, message: 'Processamento retomado em segundo plano.', job: db.getImportJob(job.id) });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Duplicates Review & Scanning Routes
+apiRouter.get('/media/duplicates', requirePermission('media.review_duplicates'), (req, res) => {
+  try {
+    const groups = db.getDuplicateGroups();
+    const allMedia = db.getMedia(false); // active assets
+
+    // Attach full media objects to each group for rich UI display
+    const enrichedGroups = groups.map((g) => ({
+      ...g,
+      mediaAssets: allMedia.filter((m) => g.mediaIds.includes(m.id)),
+    }));
+
+    res.json({
+      groups: enrichedGroups,
+      totalGroupsCount: enrichedGroups.length,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/media/scan-duplicates', requirePermission('media.review_duplicates'), (req: AuthenticatedRequest, res) => {
+  try {
+    const result = db.scanLibraryForDuplicates(req.user, getReqMeta(req));
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/media/resolve-duplicates', requirePermission('media.delete_duplicates'), (req: AuthenticatedRequest, res) => {
+  try {
+    const { groupId, actions } = req.body;
+    if (!Array.isArray(actions) || actions.length === 0) {
+      return res.status(400).json({ error: 'Nenhuma ação de resolução de duplicidade fornecida.' });
+    }
+
+    const trashedIds: string[] = [];
+    const keepIds: string[] = [];
+
+    actions.forEach((act: { mediaId: string; action: 'keep' | 'trash' | 'delete' }) => {
+      if (act.action === 'trash' || act.action === 'delete') {
+        db.softDeleteMedia(act.mediaId, req.user, getReqMeta(req));
+        trashedIds.push(act.mediaId);
+      } else {
+        keepIds.push(act.mediaId);
+        // Mark as keep_both
+        db.updateMedia(act.mediaId, { duplicateStatus: 'keep_both' }, req.user!, getReqMeta(req));
+      }
+    });
+
+    if (groupId) {
+      db.deleteDuplicateGroup(groupId);
+    }
+
+    res.json({
+      success: true,
+      trashedCount: trashedIds.length,
+      keptCount: keepIds.length,
+      message: `${trashedIds.length} mídias movidas para a Lixeira com sucesso.`,
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/media/dismiss-duplicates', requirePermission('media.review_duplicates'), (req: AuthenticatedRequest, res) => {
+  try {
+    const { groupId, mediaIds } = req.body;
+    const result = db.dismissDuplicateGroup(groupId, mediaIds, req.user, getReqMeta(req));
+    res.json(result);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Consolidation and Safety Routes
+apiRouter.post('/media/consolidate-dry-run', requirePermission('media.delete_duplicates'), (req: AuthenticatedRequest, res) => {
+  try {
+    const { masterMediaId, targetMediaIds } = req.body;
+    const result = db.consolidateMediaDryRun(masterMediaId, targetMediaIds);
+    res.json(result);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/media/consolidate', requirePermission('media.delete_duplicates'), (req: AuthenticatedRequest, res) => {
+  try {
+    const { masterMediaId, targetMediaIds } = req.body;
+    if (!masterMediaId || !Array.isArray(targetMediaIds) || targetMediaIds.length === 0) {
+      return res.status(400).json({ error: 'IDs de arquivo mestre ou de destino ausentes ou inválidos.' });
+    }
+
+    const result = db.consolidateMedia(masterMediaId, targetMediaIds, req.user, getReqMeta(req));
+    res.json(result);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/media/check-delete-safety', requirePermission('media.view'), (req, res) => {
+  try {
+    const { mediaIds } = req.body;
+    if (!Array.isArray(mediaIds) || mediaIds.length === 0) {
+      return res.status(400).json({ error: 'Lista de IDs de mídias inválida ou vazia.' });
+    }
+
+    const result = db.checkDeleteSafety(mediaIds);
+    res.json(result);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/media/test-duplicate-scenario', requirePermission('media.review_duplicates'), (req: AuthenticatedRequest, res) => {
+  try {
+    const result = db.createTestDuplicateScenario(req.user, getReqMeta(req));
+    res.json(result);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Soft Delete Trash (Lixeira) Routes
+apiRouter.get('/media/trash', requirePermission('media.view'), (req, res) => {
+  try {
+    const trashed = db.getTrashedMedia();
+    res.json(trashed);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/media/trash/restore', requirePermission('media.restore_deleted'), (req: AuthenticatedRequest, res) => {
+  try {
+    const { mediaIds } = req.body;
+    if (!Array.isArray(mediaIds) || mediaIds.length === 0) {
+      return res.status(400).json({ error: 'Nenhum ID de mídia fornecido para restauração.' });
+    }
+
+    const restored = db.bulkRestoreMedia(mediaIds, req.user, getReqMeta(req));
+    res.json({ success: true, restoredCount: restored.length });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/media/trash/empty', requirePermission('media.delete'), (req: AuthenticatedRequest, res) => {
+  try {
+    const { mediaIds } = req.body;
+    const trashed = db.getTrashedMedia();
+    const targetIds = Array.isArray(mediaIds) && mediaIds.length > 0 ? mediaIds : trashed.map((m) => m.id);
+
+    let deletedCount = 0;
+    targetIds.forEach((id) => {
+      if (db.permanentDeleteMedia(id, req.user, getReqMeta(req))) {
+        deletedCount++;
+      }
+    });
+
+    res.json({ success: true, deletedCount });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Detailed Media Usage Route
+apiRouter.get('/media/usage/:id', requirePermission('media.view'), (req, res) => {
+  try {
+    const media = db.getMedia(true).find((m) => m.id === req.params.id);
+    if (!media) return res.status(404).json({ error: 'Mídia não encontrada.' });
+
+    const locations = db.getMediaUsageLocations(media);
+    res.json({
+      mediaId: media.id,
+      mediaName: media.originalName || media.filename,
+      usageCount: locations.length,
+      locations,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Naming Config Routes
+apiRouter.get('/media/naming-config', requirePermission('media.view'), (req, res) => {
+  try {
+    const config = db.getNamingConfig();
+    res.json(config);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/media/naming-config', requirePermission('media.edit_metadata'), (req: AuthenticatedRequest, res) => {
+  try {
+    const updatedConfig = db.saveNamingConfig(req.body, req.user, getReqMeta(req));
+    res.json(updatedConfig);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.patch('/media/metadata/:id', requirePermission('media.edit_metadata'), (req: AuthenticatedRequest, res) => {
+  try {
+    const updated = db.updateMedia(req.params.id, req.body, req.user!, getReqMeta(req));
+    if (!updated) return res.status(404).json({ error: 'Mídia não encontrada.' });
+    res.json({ message: 'Metadados atualizados com sucesso.', asset: updated });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Acervo Diagnostic & Analysis Route ("ANALISAR E ORGANIZAR ACERVO ATUAL")
+apiRouter.post('/media/analyze-acervo', requirePermission('media.view'), (req, res) => {
+  try {
+    const diagnostic = db.analyzeCurrentAcervo();
+    res.json(diagnostic);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Batch Rename Application Route
+apiRouter.post('/media/apply-batch-rename', requirePermission('media.edit_metadata'), (req: AuthenticatedRequest, res) => {
+  try {
+    const { renames } = req.body;
+    if (!Array.isArray(renames) || renames.length === 0) {
+      return res.status(400).json({ error: 'Nenhum item fornecido para padronização de nomenclatura.' });
+    }
+
+    const count = db.applyBatchRename(renames, req.user!, getReqMeta(req));
+    res.json({ success: true, renamedCount: count });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// AI Suggestions Approval Route
+apiRouter.post('/media/approve-ai/:id', requirePermission('media.edit_metadata'), (req: AuthenticatedRequest, res) => {
+  try {
+    const updated = db.approveAISuggestions(req.params.id, req.body, req.user, getReqMeta(req));
+    res.json(updated);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Albums & Events Routes
+apiRouter.get('/media/albums', requirePermission('media.view'), (req, res) => {
+  res.json(db.getAlbums());
+});
+
+apiRouter.post('/media/albums', requirePermission('media.manage_albums'), (req: AuthenticatedRequest, res) => {
+  try {
+    const album = db.createAlbum(req.body, req.user!, getReqMeta(req));
+    res.status(201).json(album);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.put('/media/albums/:id', requirePermission('media.manage_albums'), (req: AuthenticatedRequest, res) => {
+  try {
+    const updated = db.updateAlbum(req.params.id, req.body, req.user!, getReqMeta(req));
+    res.json(updated);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.delete('/media/albums/:id', requirePermission('media.manage_albums'), (req: AuthenticatedRequest, res) => {
+  try {
+    const success = db.deleteAlbum(req.params.id, req.user!, getReqMeta(req));
+    res.json({ success });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Media Import Jobs Routes
+apiRouter.get('/media/import-jobs', requirePermission('media.view'), (req, res) => {
+  res.json(db.getImportJobs());
+});
+
+apiRouter.get('/media/import-jobs/:id', requirePermission('media.view'), (req, res) => {
+  const job = db.getImportJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Sessão de importação não encontrada.' });
+  res.json(job);
+});
+
+apiRouter.post('/media/import-jobs', requirePermission('media.bulk_upload'), (req: AuthenticatedRequest, res) => {
+  try {
+    const job = db.createImportJob(req.body, req.user!, getReqMeta(req));
+    res.status(201).json(job);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.put('/media/import-jobs/:id', requirePermission('media.bulk_upload'), (req: AuthenticatedRequest, res) => {
+  try {
+    const updated = db.updateImportJob(req.params.id, req.body);
+    res.json(updated);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// AI Gemini Analysis Route
+apiRouter.post('/media/ai-analyze', requirePermission('media.ai_organize'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const activeJob = db.getActiveAIJob();
+    if (activeJob) {
+      return res.status(409).json({ error: 'Já existe um processamento de IA em andamento.', job: activeJob });
+    }
+
+    const { mediaId, mediaIds, forceReanalyze } = req.body;
+    let targetIds = mediaIds || (mediaId ? [mediaId] : []);
+
+    if (targetIds.length === 0) {
+      targetIds = db.getMedia()
+        .filter(m => !m.isDeleted && (!m.aiAnalyzed || forceReanalyze))
+        .map(m => m.id);
+    }
+
+    if (targetIds.length === 0) {
+      return res.status(400).json({ error: 'Nenhuma mídia pendente de análise encontrada.' });
+    }
+
+    const job = db.createAIJob({
+      status: 'PENDING',
+      totalItems: targetIds.length,
+      processedItems: 0,
+      successItems: 0,
+      failedItems: 0,
+      skippedItems: 0,
+      pendingMediaIds: targetIds,
+      processedMediaIds: [],
+      modelUsed: GEMINI_MODEL,
+      analysisVersion: AI_ANALYSIS_VERSION,
+    }, req.user!);
+
+    res.json(job);
+  } catch (err: any) {
+    console.error('[AIAnalyze] Error:', err);
+    res.status(500).json({ error: err.message || 'Falha ao iniciar análise por IA' });
+  }
+});
+
+function requireAIOrganizeAccess() {
+  return (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Não autenticado.' });
+    }
+    if (req.user.role === 'owner' || req.user.role === 'manager' || req.user.permissions?.['media.ai_organize'] || req.user.permissions?.['media.upload']) {
+      return next();
+    }
+    return res.status(403).json({ error: 'Acesso negado: permissão de IA necessária.' });
+  };
+}
+
+// AI Media Analysis Jobs
+apiRouter.get('/media/ai-jobs', requireAIOrganizeAccess(), (req, res) => {
+  const jobs = db.getAIJobs();
+  res.json(jobs);
+});
+
+apiRouter.get('/media/ai-jobs/active', requireAIOrganizeAccess(), (req, res) => {
+  const job = db.getActiveAIJob();
+  res.json(job || null);
+});
+
+apiRouter.get('/media/ai-jobs/:id', requireAIOrganizeAccess(), (req, res) => {
+  const job = db.getAIJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job não encontrado' });
+  res.json(job);
+});
+
+apiRouter.post('/media/ai-jobs/:id/pause', requireAIOrganizeAccess(), (req, res) => {
+  const job = db.getAIJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job não encontrado' });
+  if (job.status !== 'RUNNING' && job.status !== 'RATE_LIMITED' && job.status !== 'PENDING') {
+    return res.status(400).json({ error: 'Job não está em execução' });
+  }
+  const updated = db.updateAIJob(job.id, { status: 'PAUSED' });
+  res.json(updated);
+});
+
+apiRouter.post('/media/ai-jobs/:id/resume', requireAIOrganizeAccess(), (req, res) => {
+  const job = db.getAIJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job não encontrado' });
+  if (job.status !== 'PAUSED' && job.status !== 'INTERRUPTED') {
+    return res.status(400).json({ error: 'Job não está pausado' });
+  }
+  const updated = db.updateAIJob(job.id, { status: 'RUNNING' });
+  res.json(updated);
+});
+
+apiRouter.post('/media/ai-jobs/:id/cancel', requireAIOrganizeAccess(), (req, res) => {
+  console.log(`[MediaAI Cancel] BACKEND_REQUEST received for jobId=${req.params.id}`);
+  const job = db.getAIJob(req.params.id);
+  if (!job) {
+    console.log(`[MediaAI Cancel] ERROR: Job ${req.params.id} not found`);
+    return res.status(404).json({ error: 'Job não encontrado' });
+  }
+  const updated = db.updateAIJob(job.id, { status: 'CANCELLED', finishedAt: new Date().toISOString() });
+  console.log(`[MediaAI Cancel] SUCCESS: Job ${job.id} status updated to CANCELLED`);
+  res.json(updated);
+});
+
+// AI Gemini Clustering Route
+apiRouter.post('/media/ai-cluster', requirePermission('media.ai_organize'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const { mediaIds } = req.body;
+    let assets = db.getMedia();
+
+    if (Array.isArray(mediaIds) && mediaIds.length > 0) {
+      const idSet = new Set(mediaIds);
+      assets = assets.filter((a) => idSet.has(a.id));
+    }
+
+    const clusters = await clusterMediaAssetsWithGemini(assets);
+
+    // Persist proposals for manual review
+    db.setAIClusterProposals(clusters);
+
+    res.json({
+      totalAnalyzed: assets.length,
+      clusters,
+      analyzedAt: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    console.error('[AICluster] Error:', err);
+    res.status(500).json({ error: err.message || 'Falha ao agrupar mídias com IA' });
+  }
+});
+
+apiRouter.get('/media/ai-cluster-proposals', requirePermission('media.ai_organize'), (req, res) => {
+  res.json({ clusters: db.getAIClusterProposals() });
+});
+
+apiRouter.put('/media/ai-cluster-proposals/:id', requirePermission('media.ai_organize'), (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+    const updated = db.updateAIClusterProposal(id, updates);
+    res.json(updated);
+  } catch (err: any) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+apiRouter.delete('/media/ai-cluster-proposals/:id', requirePermission('media.ai_organize'), (req, res) => {
+  const { id } = req.params;
+  const deleted = db.deleteAIClusterProposal(id);
+  res.json({ success: deleted });
+});
+
+apiRouter.post('/media/ai-cluster-proposals/set', requirePermission('media.ai_organize'), (req, res) => {
+  const { clusters } = req.body;
+  db.setAIClusterProposals(clusters);
+  res.json({ success: true });
+});
+
+apiRouter.post('/media/ai-cluster-proposals/:id/approve', requirePermission('media.ai_organize'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params;
+    const proposals = db.getAIClusterProposals();
+    const cluster = proposals.find((c) => c.id === id);
+    if (!cluster) return res.status(404).json({ error: 'Proposal not found' });
+
+    // 1. Create real album from cluster proposal
+    const album = db.createAlbum({
+      title: cluster.title,
+      description: cluster.description,
+      category: 'humanitarian',
+      tags: cluster.visibleTexts || [],
+    }, req.user!);
+
+    // 2. Assign media items to new album
+    if (cluster.mediaIds && cluster.mediaIds.length > 0) {
+      db.bulkUpdateMedia(cluster.mediaIds, {
+        albumId: album.id,
+        albumTitle: album.title,
+        eventName: cluster.suggestedEventType,
+      }, req.user!);
+    }
+
+    // 3. Remove proposal
+    db.deleteAIClusterProposal(id);
+
+    res.json({ success: true, album });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -1940,6 +2742,26 @@ apiRouter.get('/history', requirePermission('history.view'), (req, res) => {
   const { person, type, module, search } = req.query as Record<string, string>;
   const logs = db.getAuditLogs(person, type, module, search);
   res.json(logs);
+});
+
+apiRouter.post('/history/log', requireAuth, (req: AuthenticatedRequest, res) => {
+  const { action, module, affectedRecord, details } = req.body;
+  if (!action || !module || !affectedRecord) {
+    return res.status(400).json({ error: 'Ação, módulo e registro afetado são obrigatórios.' });
+  }
+  try {
+    db.recordAuditLog(
+      req.user!,
+      action,
+      module,
+      affectedRecord,
+      details || '',
+      getReqMeta(req)
+    );
+    res.status(201).json({ success: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 apiRouter.get('/history/export', requirePermission('history.export'), (req, res) => {

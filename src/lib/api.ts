@@ -5,6 +5,10 @@ import {
   Ambassador,
   PrivateDocument,
   MediaAsset,
+  MediaAlbum,
+  MediaImportJob,
+  DuplicateGroup,
+  AIClusterGroup,
   Donation,
   Task,
   TaskChecklistItem,
@@ -25,6 +29,11 @@ import {
   ContactRequest,
   MaintenanceSettings,
   MaintenanceConfig,
+  NamingConfig,
+  AcervoDiagnosticReport,
+  MediaUsageLocation,
+  MediaAIJob,
+  MediaAIJobStatus,
 } from '../types';
 
 class ApiClient {
@@ -384,6 +393,450 @@ class ApiClient {
     });
   }
 
+  public async bulkEditMedia(ids: string[], updates: Partial<MediaAsset>): Promise<MediaAsset[]> {
+    return this.request<MediaAsset[]>('/api/media/bulk-edit', {
+      method: 'POST',
+      body: JSON.stringify({ ids, updates }),
+    });
+  }
+
+  public async uploadMediaDirect(
+    file: File,
+    meta?: { title?: string; albumId?: string; sha256?: string }
+  ): Promise<{ isDuplicate: boolean; asset: MediaAsset; duplicateOfId?: string; message?: string }> {
+    let sha256Hex = meta?.sha256 || '';
+    if (!sha256Hex && typeof window !== 'undefined' && window.crypto && window.crypto.subtle) {
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const hashBuffer = await window.crypto.subtle.digest('SHA-256', arrayBuffer);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        sha256Hex = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+      } catch (e) {
+        console.warn('Could not compute client-side SHA256:', e);
+      }
+    }
+
+    const headers: Record<string, string> = {
+      'Content-Type': file.type || 'application/octet-stream',
+      'x-file-name': encodeURIComponent(file.name),
+      'x-mime-type': file.type || 'image/jpeg',
+      'x-sha256': sha256Hex,
+      'x-title': encodeURIComponent(meta?.title || file.name),
+      'x-album-id': meta?.albumId || '',
+    };
+
+    const token = typeof localStorage !== 'undefined' ? localStorage.getItem('admir_auth_token') : null;
+    if (token) {
+      headers['x-user-id'] = token;
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const res = await fetch('/api/media/upload-direct', {
+      method: 'POST',
+      headers,
+      body: file,
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'Upload failed' }));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+
+    return res.json();
+  }
+
+  public async uploadArchive(file: File, onProgress?: (pct: number) => void): Promise<any> {
+    const startTime = Date.now();
+    console.log('[R2 TRACE 01] CHUNKED_UPLOAD_START', { fileName: file.name, fileSize: file.size });
+    
+    // Define chunk size: 15 MB (15 * 1024 * 1024 bytes) - safe under the 32MB Cloud Run limit
+    const CHUNK_SIZE = 15 * 1024 * 1024;
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const uploadId = `${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+
+    console.log('[R2 TRACE 02] CHUNK_PLAN_CREATED', {
+      chunkSize: CHUNK_SIZE,
+      totalChunks,
+      uploadId,
+    });
+
+    let lastReport: any = null;
+
+    // Upload each chunk sequentially
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      const start = chunkIndex * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, file.size);
+      const chunkBlob = file.slice(start, end);
+
+      console.log(`[R2 TRACE 04] DIRECT_UPLOAD_START (Chunk ${chunkIndex + 1}/${totalChunks})`, {
+        start,
+        end,
+        size: chunkBlob.size,
+      });
+
+      // Prepare headers for the chunk
+      const headers = {
+        ...(this.getHeaders() as Record<string, string>),
+        'Content-Type': 'application/octet-stream', // Force application/octet-stream to prevent JSON parser interception
+        'x-upload-id': uploadId,
+        'x-chunk-index': chunkIndex.toString(),
+        'x-chunk-total': totalChunks.toString(),
+        'x-file-name': encodeURIComponent(file.name),
+      };
+
+      // Upload using XMLHttpRequest to get individual progress if desired (or just sequential step-by-step progress)
+      await new Promise<void>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/media/upload-archive-chunk', true);
+
+        // Map headers
+        Object.entries(headers).forEach(([key, value]) => {
+          xhr.setRequestHeader(key, value);
+        });
+
+        if (xhr.upload && onProgress) {
+          xhr.upload.onprogress = (evt) => {
+            if (evt.lengthComputable) {
+              // Calculate global progress
+              const uploadedBytesPrior = chunkIndex * CHUNK_SIZE;
+              const globalUploaded = uploadedBytesPrior + evt.loaded;
+              const percentComplete = Math.min(Math.round((globalUploaded / file.size) * 100), 98); // save 99/100 for processing phase
+              console.log(`[R2 TRACE 05] DIRECT_UPLOAD_PROGRESS: ${percentComplete}% (${globalUploaded}/${file.size} bytes)`);
+              onProgress(percentComplete);
+            }
+          };
+        }
+
+        xhr.onload = () => {
+          const elapsed = Date.now() - startTime;
+          console.log('[R2 TRACE 06] DIRECT_UPLOAD_RESPONSE', {
+            status: xhr.status,
+            statusText: xhr.statusText,
+            chunk: `${chunkIndex + 1}/${totalChunks}`,
+            elapsedMs: elapsed
+          });
+
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try {
+              lastReport = JSON.parse(xhr.responseText);
+            } catch (_) {}
+            resolve();
+          } else {
+            const rawResponse = xhr.responseText || '';
+            const responseSnippet = rawResponse.substring(0, 500).replace(/[\r\n]+/g, ' ');
+            reject(new Error(
+              `Falha ao enviar fatia ${chunkIndex + 1}/${totalChunks} (HTTP ${xhr.status} ${xhr.statusText}). ` +
+              `Resposta: ${responseSnippet || '(Sem conteúdo)'}`
+            ));
+          }
+        };
+
+        xhr.onerror = () => {
+          const elapsed = Date.now() - startTime;
+          console.error('[R2 TRACE ERROR] DIRECT_UPLOAD_FAILED', {
+            status: xhr.status,
+            statusText: xhr.statusText,
+            readyState: xhr.readyState,
+            chunk: `${chunkIndex + 1}/${totalChunks}`,
+            elapsedMs: elapsed
+          });
+          reject(new Error(
+            `Erro de conexão ou rede ao enviar fatia ${chunkIndex + 1}/${totalChunks} do pacote compactado.`
+          ));
+        };
+
+        xhr.send(chunkBlob);
+      });
+    }
+
+    if (onProgress) onProgress(99);
+    console.log('[R2 TRACE 07] DIRECT_UPLOAD_COMPLETE', { uploadId });
+    if (onProgress) onProgress(100);
+
+    return lastReport || { success: true, message: 'Upload completo.' };
+  }
+
+  public async getDuplicateGroups(): Promise<{ groups: (DuplicateGroup & { mediaAssets: MediaAsset[] })[]; totalGroupsCount: number }> {
+    return this.request<{ groups: (DuplicateGroup & { mediaAssets: MediaAsset[] })[]; totalGroupsCount: number }>('/api/media/duplicates');
+  }
+
+  public async scanDuplicates(): Promise<{ 
+    totalScanned: number; 
+    newGroupsCount: number; 
+    reevaluatedCount: number;
+    removedCount: number;
+    reclassifiedCount: number;
+    keptCount: number;
+    groups: DuplicateGroup[] 
+  }> {
+    return this.request<{ 
+      totalScanned: number; 
+      newGroupsCount: number; 
+      reevaluatedCount: number;
+      removedCount: number;
+      reclassifiedCount: number;
+      keptCount: number;
+      groups: DuplicateGroup[] 
+    }>('/api/media/scan-duplicates', {
+      method: 'POST',
+    });
+  }
+
+  public async resolveDuplicates(groupId: string | undefined, actions: { mediaId: string; action: 'keep' | 'trash' | 'delete' }[]): Promise<{ success: boolean; trashedCount: number; keptCount: number; message: string }> {
+    return this.request<{ success: boolean; trashedCount: number; keptCount: number; message: string }>('/api/media/resolve-duplicates', {
+      method: 'POST',
+      body: JSON.stringify({ groupId, actions }),
+    });
+  }
+
+  public async dismissDuplicates(groupId?: string, mediaIds?: string[]): Promise<{ success: boolean; message: string }> {
+    return this.request<{ success: boolean; message: string }>('/api/media/dismiss-duplicates', {
+      method: 'POST',
+      body: JSON.stringify({ groupId, mediaIds }),
+    });
+  }
+
+  public async getTrashedMedia(): Promise<MediaAsset[]> {
+    return this.request<MediaAsset[]>('/api/media/trash');
+  }
+
+  public async restoreTrashedMedia(mediaIds: string[]): Promise<{ success: boolean; restoredCount: number }> {
+    return this.request<{ success: boolean; restoredCount: number }>('/api/media/trash/restore', {
+      method: 'POST',
+      body: JSON.stringify({ mediaIds }),
+    });
+  }
+
+  public async emptyTrash(mediaIds?: string[]): Promise<{ success: boolean; deletedCount: number }> {
+    return this.request<{ success: boolean; deletedCount: number }>('/api/media/trash/empty', {
+      method: 'POST',
+      body: JSON.stringify({ mediaIds }),
+    });
+  }
+
+  public async updateMediaMetadata(id: string, metadata: Partial<MediaAsset>): Promise<{ message: string; asset: MediaAsset }> {
+    return this.request<{ message: string; asset: MediaAsset }>(`/api/media/metadata/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(metadata),
+    });
+  }
+
+  public async getMediaUsage(id: string): Promise<{ mediaId: string; mediaName: string; usageCount: number; locations: MediaUsageLocation[] }> {
+    return this.request<{ mediaId: string; mediaName: string; usageCount: number; locations: MediaUsageLocation[] }>(`/api/media/usage/${id}`);
+  }
+
+  public async consolidateMedia(
+    masterMediaId: string,
+    targetMediaIds: string[]
+  ): Promise<{ success: boolean; masterMedia: MediaAsset; updatedReferencesCount: number; message: string }> {
+    return this.request<{ success: boolean; masterMedia: MediaAsset; updatedReferencesCount: number; message: string }>('/api/media/consolidate', {
+      method: 'POST',
+      body: JSON.stringify({ masterMediaId, targetMediaIds }),
+    });
+  }
+
+  public async consolidateMediaDryRun(masterMediaId: string, targetMediaIds: string[]): Promise<{
+    master: MediaAsset;
+    targets: { id: string; originalName: string; usages: any[] }[];
+    totalChanges: number;
+  }> {
+    return this.request('/api/media/consolidate-dry-run', {
+      method: 'POST',
+      body: JSON.stringify({ masterMediaId, targetMediaIds }),
+    });
+  }
+
+  public async checkDeleteSafety(mediaIds: string[]): Promise<{
+    totalSelected: number;
+    unusedCount: number;
+    usedCount: number;
+    unknownCount: number;
+    safeToDeleteIds: string[];
+    blockedItems: { id: string; name: string; usageCount: number; locations: MediaUsageLocation[] }[];
+  }> {
+    return this.request<any>('/api/media/check-delete-safety', {
+      method: 'POST',
+      body: JSON.stringify({ mediaIds }),
+    });
+  }
+
+  public async createTestDuplicateScenario(): Promise<{
+    message: string;
+    mediaA: MediaAsset;
+    mediaB: MediaAsset;
+    mediaC: MediaAsset;
+  }> {
+    return this.request<any>('/api/media/test-duplicate-scenario', {
+      method: 'POST',
+    });
+  }
+
+  public async getNamingConfig(): Promise<NamingConfig> {
+    return this.request<NamingConfig>('/api/media/naming-config');
+  }
+
+  public async saveNamingConfig(config: NamingConfig): Promise<NamingConfig> {
+    return this.request<NamingConfig>('/api/media/naming-config', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    });
+  }
+
+  public async analyzeCurrentAcervo(): Promise<AcervoDiagnosticReport> {
+    return this.request<AcervoDiagnosticReport>('/api/media/analyze-acervo', {
+      method: 'POST',
+    });
+  }
+
+  public async applyBatchRename(renames: { assetId: string; newOrganizedName: string }[]): Promise<{ success: boolean; renamedCount: number }> {
+    return this.request<{ success: boolean; renamedCount: number }>('/api/media/apply-batch-rename', {
+      method: 'POST',
+      body: JSON.stringify({ renames }),
+    });
+  }
+
+  public async approveAISuggestions(id: string, overrides?: Partial<MediaAsset>): Promise<MediaAsset> {
+    return this.request<MediaAsset>(`/api/media/approve-ai/${id}`, {
+      method: 'POST',
+      body: JSON.stringify(overrides || {}),
+    });
+  }
+
+  // --- CMS: MEDIA ALBUMS ---
+  public async getAlbums(): Promise<MediaAlbum[]> {
+    return this.request<MediaAlbum[]>('/api/media/albums');
+  }
+
+  public async createAlbum(album: Partial<MediaAlbum>): Promise<MediaAlbum> {
+    return this.request<MediaAlbum>('/api/media/albums', {
+      method: 'POST',
+      body: JSON.stringify(album),
+    });
+  }
+
+  public async updateAlbum(id: string, updates: Partial<MediaAlbum>): Promise<MediaAlbum> {
+    return this.request<MediaAlbum>(`/api/media/albums/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(updates),
+    });
+  }
+
+  public async deleteAlbum(id: string): Promise<{ success: boolean }> {
+    return this.request<{ success: boolean }>(`/api/media/albums/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // --- CMS: MEDIA IMPORT JOBS ---
+  public async getImportJobs(): Promise<MediaImportJob[]> {
+    return this.request<MediaImportJob[]>('/api/media/import-jobs');
+  }
+
+  public async getImportJob(id: string): Promise<MediaImportJob> {
+    return this.request<MediaImportJob>(`/api/media/import-jobs/${id}`);
+  }
+
+  public async createImportJob(job: Partial<MediaImportJob>): Promise<MediaImportJob> {
+    return this.request<MediaImportJob>('/api/media/import-jobs', {
+      method: 'POST',
+      body: JSON.stringify(job),
+    });
+  }
+
+  public async updateImportJob(id: string, updates: Partial<MediaImportJob>): Promise<MediaImportJob> {
+    return this.request<MediaImportJob>(`/api/media/import-jobs/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(updates),
+    });
+  }
+
+  public async cancelImportJob(id: string): Promise<{ success: boolean; message: string; job: MediaImportJob }> {
+    return this.request<any>(`/api/media/import-jobs/${id}/cancel`, {
+      method: 'POST',
+    });
+  }
+
+  public async retryImportJob(id: string): Promise<{ success: boolean; message: string; job: MediaImportJob }> {
+    return this.request<any>(`/api/media/import-jobs/${id}/retry`, {
+      method: 'POST',
+    });
+  }
+
+  // --- CMS: MEDIA AI ORGANIZATION & CLUSTERING ---
+  public async analyzeMediaWithAI(targetIds?: string[], forceReanalyze: boolean = false): Promise<MediaAIJob> {
+    return this.request<MediaAIJob>('/api/media/ai-analyze', {
+      method: 'POST',
+      body: JSON.stringify({ targetIds, forceReanalyze }),
+    });
+  }
+
+  public async getActiveAIJob(): Promise<MediaAIJob | null> {
+    return this.request<MediaAIJob | null>('/api/media/ai-jobs/active');
+  }
+
+  public async getAIJob(id: string): Promise<MediaAIJob> {
+    if (!id) throw new Error('ID do job de IA é obrigatório.');
+    return this.request<MediaAIJob>(`/api/media/ai-jobs/${encodeURIComponent(id)}`);
+  }
+
+  public async pauseAIJob(id: string): Promise<MediaAIJob> {
+    if (!id) throw new Error('ID do job de IA é obrigatório.');
+    return this.request<MediaAIJob>(`/api/media/ai-jobs/${encodeURIComponent(id)}/pause`, {
+      method: 'POST',
+    });
+  }
+
+  public async resumeAIJob(id: string): Promise<MediaAIJob> {
+    if (!id) throw new Error('ID do job de IA é obrigatório.');
+    return this.request<MediaAIJob>(`/api/media/ai-jobs/${encodeURIComponent(id)}/resume`, {
+      method: 'POST',
+    });
+  }
+
+  public async cancelAIJob(id: string): Promise<MediaAIJob> {
+    if (!id) throw new Error('ID do job de IA é obrigatório.');
+    return this.request<MediaAIJob>(`/api/media/ai-jobs/${encodeURIComponent(id)}/cancel`, {
+      method: 'POST',
+    });
+  }
+
+  public async clusterMediaWithAI(mediaIds?: string[]): Promise<{ totalAnalyzed: number; clusters: AIClusterGroup[]; analyzedAt: string }> {
+    return this.request<{ totalAnalyzed: number; clusters: AIClusterGroup[]; analyzedAt: string }>('/api/media/ai-cluster', {
+      method: 'POST',
+      body: JSON.stringify({ mediaIds }),
+    });
+  }
+
+  public async getAIClusterProposals(): Promise<{ clusters: AIClusterGroup[] }> {
+    return this.request<{ clusters: AIClusterGroup[] }>('/api/media/ai-cluster-proposals');
+  }
+
+  public async updateAIClusterProposal(id: string, updates: Partial<AIClusterGroup>): Promise<AIClusterGroup> {
+    return this.request<AIClusterGroup>(`/api/media/ai-cluster-proposals/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(updates),
+    });
+  }
+
+  public async deleteAIClusterProposal(id: string): Promise<{ success: boolean }> {
+    return this.request<{ success: boolean }>(`/api/media/ai-cluster-proposals/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  public async approveAIClusterProposal(id: string): Promise<{ success: boolean; album: MediaAlbum }> {
+    return this.request<{ success: boolean; album: MediaAlbum }>(`/api/media/ai-cluster-proposals/${id}/approve`, {
+      method: 'POST',
+    });
+  }
+
+  public async setAIClusterProposals(clusters: AIClusterGroup[]): Promise<{ success: boolean }> {
+    return this.request<{ success: boolean }>('/api/media/ai-cluster-proposals/set', {
+      method: 'POST',
+      body: JSON.stringify({ clusters }),
+    });
+  }
+
   // --- CMS: DONATIONS ---
   public async getDonations(filters?: { search?: string; period?: string; status?: string; type?: string }): Promise<{
     donations: Donation[];
@@ -686,6 +1139,13 @@ class ApiClient {
     if (filters?.search) params.append('search', filters.search);
 
     return this.request<AuditLog[]>(`/api/history?${params.toString()}`);
+  }
+
+  public async logHistory(action: string, module: string, affectedRecord: string, details?: string): Promise<{ success: boolean }> {
+    return this.request<{ success: boolean }>('/api/history/log', {
+      method: 'POST',
+      body: JSON.stringify({ action, module, affectedRecord, details }),
+    });
   }
 
   // --- ASSISTANTE VIRTUAL & CANAIS ---
