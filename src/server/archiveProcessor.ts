@@ -407,8 +407,22 @@ export async function runArchiveImportWorker(
           const dHash = calculateDHash(fileBuffer);
           jobItem.sha256 = sha256;
 
-            // Save image to Cloudflare R2
-            let storageResult: { storageKey: string; publicUrl: string };
+          // Check if exact file hash already exists in storage to avoid redundant R2 uploads
+          const existingExact = [...existingMedia, ...createdAssets].find(
+            (m) => m.sha256 === sha256 && !m.isDeleted
+          );
+
+          let storageResult: { storageKey: string; publicUrl: string };
+
+          if (existingExact) {
+            // Content already persisted in R2: reuse existing storage location without re-uploading
+            console.log(`[ARCHIVE TRACE] Exact SHA-256 duplicate found for ${jobItem.filename}. Reusing storage key ${existingExact.filename}`);
+            storageResult = {
+              storageKey: existingExact.filename,
+              publicUrl: existingExact.url,
+            };
+          } else {
+            // Save new unique image to Cloudflare R2
             try {
               const entryName = entry.entryName;
               const folderParts = entryName.split('/').filter(Boolean);
@@ -430,6 +444,7 @@ export async function runArchiveImportWorker(
               failedCount++;
               return;
             }
+          }
 
           // Prepare metadata record
           const mediaId = `media-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;

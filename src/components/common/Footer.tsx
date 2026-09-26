@@ -12,6 +12,7 @@ import { useSite } from '../../context/SiteContext';
 import { useToast } from '../../context/ToastContext';
 import { useTranslation } from '../../i18n/useTranslation';
 import { api } from '../../lib/api';
+import { PrivacyNotice } from './PrivacyNotice';
 
 export function Footer() {
   const { navigateTo, openDonationModal, settings, language } = useSite();
@@ -334,8 +335,10 @@ export function Footer() {
             © {new Date().getFullYear()} ADMIR — American Diplomatic Mission of International Relations. {t('footer.rights')}
           </div>
 
-          <div className="flex items-center gap-6">
+          <div className="flex flex-wrap items-center justify-center gap-4 sm:gap-6">
             <span>{t('footer.diplomaticDisclaimer')}</span>
+            <span>•</span>
+            <PrivacyNotice context="general" theme="dark" variant="inline" />
             <span>•</span>
             <button
               type="button"

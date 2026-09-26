@@ -14,6 +14,7 @@ import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
 import { api } from '../../lib/api';
 import { AuditLog } from '../../types';
+import { PrivacyNotice } from '../common/PrivacyNotice';
 
 export function AdminHistory() {
   const { hasPermission } = useAuth();
@@ -107,6 +108,8 @@ export function AdminHistory() {
           </button>
         )}
       </div>
+
+      <PrivacyNotice context="admin_users" theme="light" variant="compact" />
 
       {/* Filter Bar */}
       <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-col md:flex-row items-center justify-between gap-4">

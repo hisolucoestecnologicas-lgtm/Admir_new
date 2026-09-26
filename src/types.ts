@@ -530,9 +530,52 @@ export type AmbassadorOnboardingStatus =
 
 export type AmbassadorEditorialStatus = 'draft' | 'published';
 
+export type DocumentCategory = 'identification' | 'residence' | 'professional' | 'legal' | 'health' | 'other';
+
+export type RuleSourceType =
+  | 'ADMIR_INTERNAL'
+  | 'LEGAL_REFERENCE'
+  | 'ADMIN_DECISION'
+  | 'IMPORTED'
+  | 'DEMO'
+  | 'TEST'
+  | 'UNKNOWN';
+
+export interface CountryDocumentTranslation {
+  name?: string;
+  description?: string;
+  candidateInstructions?: string;
+}
+
+export interface CountryDocumentRule {
+  id: string;
+  country: string;              // e.g. "Brasil", "United States", or "Padrão / Global Fallback"
+  countryIso: string;           // ISO 3166-1 alpha-2 e.g. "BR", "US", "AR", or "DEFAULT"
+  documentCode: string;         // e.g. "passport", "cpf", "national_id", "photo", "curriculum", "residence_proof"
+  documentName: string;         // e.g. "Cópia do Passaporte"
+  description: string;
+  isRequired: boolean;
+  category: DocumentCategory;
+  allowedFormats: string[];     // e.g. ["application/pdf", "image/jpeg", "image/png"]
+  validityRequired?: boolean;
+  candidateInstructions?: string;
+  isActive: boolean;
+  orderIndex: number;
+  sourceType?: RuleSourceType;   // Provenance/classification of the rule (prevents unverified legal claims)
+  sourceReference?: string;     // Institutional act, resolution, decree, or administrative citation
+  administrativeNotes?: string; // Internal notes regarding administrative requirement justification
+  translations?: {
+    pt?: CountryDocumentTranslation;
+    en?: CountryDocumentTranslation;
+    es?: CountryDocumentTranslation;
+  };
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export interface PrivateDocument {
   id: string;
-  type: 'photo' | 'curriculum' | 'passport' | 'cpf' | 'rg' | 'blood_type' | 'other';
+  type: 'photo' | 'curriculum' | 'passport' | 'cpf' | 'rg' | 'blood_type' | 'other' | string;
   fileName: string;
   originalName: string;
   fileSize: number;
@@ -541,6 +584,8 @@ export interface PrivateDocument {
   path: string;
   storageProvider?: 'FILESYSTEM' | 'FIRESTORE' | 'R2_PRIVATE';
   storageKey?: string;
+  ruleId?: string;
+  documentCode?: string;
 }
 
 export interface AmbassadorTranslation {
@@ -552,6 +597,45 @@ export interface AmbassadorTranslation {
   specialty?: string;
   seoTitle?: string;
   seoDescription?: string;
+}
+
+export type DocumentValidationFieldResult =
+  | 'CONFERE'
+  | 'DIVERGÊNCIA ENCONTRADA'
+  | 'NÃO FOI POSSÍVEL VALIDAR'
+  | 'NÃO CONSTA NO DOCUMENTO'
+  | 'NÃO APLICÁVEL';
+
+export interface DocumentFieldValidation {
+  fieldName: 'fullName' | 'cpf' | 'rgDni' | 'passportNumber' | 'birthDate';
+  fieldLabel: string;
+  registeredValue: string;
+  extractedValue: string;
+  result: DocumentValidationFieldResult;
+  confidence?: 'ALTA' | 'MÉDIA' | 'BAIXA';
+  notes?: string;
+}
+
+export interface DocumentValidationRecord {
+  analysisId: string;
+  ambassadorId: string;
+  documentId: string;
+  documentType: string;
+  documentOriginalName: string;
+  model: string;
+  createdAt: string;
+  analyzedAt: string;
+  status: 'completed' | 'error' | 'unreadable';
+  errorMessage?: string;
+  summary: {
+    totalFields: number;
+    matchingCount: number;
+    divergenceCount: number;
+    unverifiableCount: number;
+    notPresentCount: number;
+    notApplicableCount: number;
+  };
+  fields: DocumentFieldValidation[];
 }
 
 export interface Ambassador {
@@ -593,12 +677,15 @@ export interface Ambassador {
 
   // Private Documents (never returned on public endpoints)
   documents?: PrivateDocument[];
+  documentValidations?: DocumentValidationRecord[];
 
   // Onboarding Token Information
   onboardingToken?: string;
   tokenCreatedAt?: string;
   tokenExpiresAt?: string;
   tokenStatus?: 'active' | 'expired' | 'revoked' | 'completed';
+  onboardingTokenRevokedAt?: string;
+  tokenRevokedAt?: string;
 
   linkedin?: string;
   socialLinks?: string;
@@ -1047,6 +1134,13 @@ export type AuditActionType =
   | 'Publicação'
   | 'Despublicação'
   | 'Reembolso'
+  | 'Geração de Link'
+  | 'Regeneração de Link'
+  | 'Revogação de Link'
+  | 'VALIDAÇÃO DOCUMENTAL EXECUTADA'
+  | 'REANÁLISE DOCUMENTAL EXECUTADA'
+  | 'DIVERGÊNCIA REVISADA'
+  | 'ALTERAÇÃO CADASTRAL A PARTIR DE DOCUMENTO'
   | 'ADMIN_INVITE_CREATED'
   | 'ADMIN_INVITE_ACCEPTED'
   | 'ADMIN_ACCESS_GRANTED'

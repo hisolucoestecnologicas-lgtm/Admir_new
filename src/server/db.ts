@@ -4,11 +4,19 @@ import path from 'path';
 import crypto from 'crypto';
 import { compareMediaAssets, generateDuplicateRecommendation } from './duplicateDetector';
 import {
+  validateCPF,
+  validateEmail,
+  validateBirthDate,
+  sanitizeRG_DNI,
+  sanitizePassport,
+} from '../utils/validation';
+import {
   SiteSettings,
   Program,
   Story,
   Ambassador,
   PrivateDocument,
+  DocumentValidationRecord,
   MediaAsset,
   MediaAlbum,
   MediaImportJob,
@@ -44,6 +52,7 @@ import {
   AISuggestionData,
   NamingConfig,
   AcervoDiagnosticReport,
+  CountryDocumentRule,
 } from '../types';
 import { DEFAULT_NAMING_CONFIG, generateOrganizedName } from './namingService';
 import {
@@ -59,6 +68,7 @@ import {
   INITIAL_INVITES,
   INITIAL_AUDIT_LOGS,
   INITIAL_MAINTENANCE_SETTINGS,
+  INITIAL_COUNTRY_DOCUMENT_RULES,
 } from '../data/initialData';
 import { getPresetPermissions } from '../data/permissionPresets';
 
@@ -92,6 +102,50 @@ interface DatabaseSchema {
   namingConfig?: NamingConfig;
   aiClusterProposals?: AIClusterGroup[];
   aiJobs?: MediaAIJob[];
+  countryDocumentRules?: CountryDocumentRule[];
+}
+
+export function normalizeCountryIso(countryStr?: string | null): string {
+  if (!countryStr) return 'DEFAULT';
+  const norm = countryStr
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  if (norm === 'brasil' || norm === 'brazil' || norm === 'br') return 'BR';
+  if (
+    norm === 'estados unidos' ||
+    norm === 'estados unidos da america' ||
+    norm === 'united states' ||
+    norm === 'united states of america' ||
+    norm === 'usa' ||
+    norm === 'us' ||
+    norm === 'eua'
+  )
+    return 'US';
+  if (norm === 'argentina' || norm === 'ar') return 'AR';
+  if (norm === 'portugal' || norm === 'pt') return 'PT';
+  if (norm === 'espanha' || norm === 'spain' || norm === 'espana' || norm === 'es') return 'ES';
+  if (norm === 'colombia' || norm === 'co') return 'CO';
+  if (norm === 'paraguai' || norm === 'paraguay' || norm === 'py') return 'PY';
+  if (norm === 'uruguai' || norm === 'uruguay' || norm === 'uy') return 'UY';
+  if (norm === 'chile' || norm === 'cl') return 'CL';
+  if (norm === 'reino unido' || norm === 'united kingdom' || norm === 'uk' || norm === 'gb') return 'GB';
+  if (norm === 'franca' || norm === 'france' || norm === 'fr') return 'FR';
+  if (norm === 'italia' || norm === 'italy' || norm === 'it') return 'IT';
+  if (norm === 'alemanha' || norm === 'germany' || norm === 'deutschland' || norm === 'de') return 'DE';
+  if (norm === 'suica' || norm === 'switzerland' || norm === 'ch') return 'CH';
+  if (norm === 'japao' || norm === 'japan' || norm === 'jp') return 'JP';
+  if (norm === 'angola' || norm === 'ao') return 'AO';
+  if (norm === 'mocambique' || norm === 'mozambique' || norm === 'mz') return 'MZ';
+  if (norm === 'cabo verde' || norm === 'cape verde' || norm === 'cv') return 'CV';
+
+  if (/^[a-zA-Z]{2}$/.test(countryStr.trim())) {
+    return countryStr.trim().toUpperCase();
+  }
+
+  return 'DEFAULT';
 }
 
 export interface RequestMetadata {
@@ -212,10 +266,25 @@ class DatabaseService {
           if (!parsed.maintenanceSettings) {
             parsed.maintenanceSettings = JSON.parse(JSON.stringify(INITIAL_MAINTENANCE_SETTINGS));
           }
+          let changedCountryRules = false;
+          if (!parsed.countryDocumentRules || parsed.countryDocumentRules.length === 0) {
+            parsed.countryDocumentRules = JSON.parse(JSON.stringify(INITIAL_COUNTRY_DOCUMENT_RULES));
+            changedCountryRules = true;
+          } else {
+            // Reconcile provenance on existing rules if missing
+            for (const r of parsed.countryDocumentRules) {
+              if (!r.sourceType) {
+                r.sourceType = 'DEMO';
+                r.sourceReference = r.sourceReference || 'DEMO-SCAFFOLDING-AI';
+                r.administrativeNotes = r.administrativeNotes || 'Regra de demonstração técnica migrada para conformidade de procedência.';
+                changedCountryRules = true;
+              }
+            }
+          }
 
           const changedAccounts = this.reconcileOfficialAccounts(parsed);
           const changedTasks = this.migrateLegacyTasks(parsed);
-          if (changedAccounts || changedTasks) {
+          if (changedAccounts || changedTasks || changedCountryRules) {
             this.save(parsed);
           }
           (global as any).__startup_timers.loadDatabaseEnd = performance.now();
@@ -278,6 +347,7 @@ class DatabaseService {
         },
       ],
       maintenanceSettings: JSON.parse(JSON.stringify(INITIAL_MAINTENANCE_SETTINGS)),
+      countryDocumentRules: JSON.parse(JSON.stringify(INITIAL_COUNTRY_DOCUMENT_RULES)),
     };
 
     this.reconcileOfficialAccounts(defaultDb);
@@ -767,30 +837,52 @@ class DatabaseService {
     pendingItems: string[];
   } {
     const docs = a.documents || [];
-    const hasDocType = (type: string) => docs.some((d) => d.type === type);
+    const rules = this.getApplicableRulesForCountry(a.country);
 
     const fullName = a.fullName || a.name || '';
 
-    const checks = [
+    const checks: { label: string; ok: boolean }[] = [
       { label: 'Nome completo', ok: Boolean(fullName && fullName.trim().length > 0) },
-      { label: 'Passaporte', ok: Boolean(a.passportNumber && a.passportNumber.trim().length > 0) },
-      { label: 'CPF', ok: Boolean(a.cpf && a.cpf.trim().length > 0) },
-      { label: 'RG / DNI', ok: Boolean(a.rgDni && a.rgDni.trim().length > 0) },
-      { label: 'Data de nascimento', ok: Boolean(a.birthDate && a.birthDate.trim().length > 0) },
-      { label: 'Tipo sanguíneo', ok: Boolean(a.bloodType && a.bloodType.trim().length > 0) },
-      { label: 'Nome do pai', ok: Boolean(a.fatherName && a.fatherName.trim().length > 0) },
-      { label: 'Nome da mãe', ok: Boolean(a.motherName && a.motherName.trim().length > 0) },
       { label: 'E-mail', ok: Boolean(a.email && a.email.trim().length > 0) },
       { label: 'Telefone', ok: Boolean(a.phone && a.phone.trim().length > 0) },
       { label: 'Profissão', ok: Boolean(a.profession && a.profession.trim().length > 0) },
-      { label: 'Endereço', ok: Boolean(a.address && a.address.trim().length > 0) },
+      { label: 'Endereço residencial', ok: Boolean(a.address && a.address.trim().length > 0) },
       { label: 'Resumo curricular', ok: Boolean(a.curriculumSummary && a.curriculumSummary.trim().length > 0) },
-      { label: 'Foto oficial', ok: Boolean((a.photo && a.photo.trim().length > 0) || hasDocType('photo')) },
-      { label: 'Cópia do passaporte', ok: hasDocType('passport') },
-      { label: 'Cópia do CPF', ok: hasDocType('cpf') },
-      { label: 'Cópia do RG/DNI', ok: hasDocType('rg') },
-      { label: 'Currículo (arquivo)', ok: hasDocType('curriculum') },
+      { label: 'Data de nascimento', ok: Boolean(a.birthDate && a.birthDate.trim().length > 0) },
     ];
+
+    // Check if CPF is required by the country rules (e.g. BR)
+    const isCpfExplicitlyRequired = rules.some(
+      (r) => r.isActive && r.isRequired && (r.documentCode === 'cpf' || r.documentName.toLowerCase().includes('cpf'))
+    );
+    if (isCpfExplicitlyRequired) {
+      checks.push({ label: 'CPF', ok: Boolean(a.cpf && a.cpf.trim().length > 0) });
+    }
+
+    // Dynamic document check based on country rules
+    const requiredRules = rules.filter((r) => r.isActive && r.isRequired);
+
+    if (requiredRules.length > 0) {
+      for (const rule of requiredRules) {
+        const hasDoc = docs.some(
+          (d) =>
+            d.ruleId === rule.id ||
+            d.documentCode === rule.documentCode ||
+            d.type === rule.documentCode ||
+            (rule.documentCode === 'photo' && ((a.photo && a.photo.trim().length > 0) || d.type === 'photo')) ||
+            (rule.documentCode === 'passport' && (d.type === 'passport' || d.type === 'rg'))
+        );
+        checks.push({ label: rule.documentName, ok: hasDoc });
+      }
+    } else {
+      const hasPhoto = Boolean((a.photo && a.photo.trim().length > 0) || docs.some((d) => d.type === 'photo'));
+      checks.push({ label: 'Foto oficial', ok: hasPhoto });
+      checks.push({
+        label: 'Documento de identificação com foto',
+        ok: docs.some((d) => d.type === 'passport' || d.type === 'rg' || d.type === 'cpf'),
+      });
+      checks.push({ label: 'Currículo (arquivo)', ok: docs.some((d) => d.type === 'curriculum') });
+    }
 
     const completed = checks.filter((c) => c.ok).length;
     const pendingItems = checks.filter((c) => !c.ok).map((c) => c.label);
@@ -884,6 +976,17 @@ class DatabaseService {
   }
 
   public createAmbassador(data: Omit<Ambassador, 'id' | 'createdAt' | 'updatedAt'>, user: User, meta?: RequestMetadata): Ambassador {
+    if (data.cpf && !validateCPF(data.cpf)) {
+      throw new Error('CPF informado é inválido. Verifique os dígitos informados.');
+    }
+    if (data.email && !validateEmail(data.email)) {
+      throw new Error('Endereço de e-mail informado é inválido.');
+    }
+    if (data.birthDate) {
+      const bd = validateBirthDate(data.birthDate);
+      if (!bd.valid) throw new Error(bd.message || 'Data de nascimento inválida.');
+    }
+
     const id = `amb-${Date.now()}`;
     const maxOrder = this.data.ambassadors.reduce((m, a) => Math.max(m, a.orderIndex || 0), 0);
 
@@ -894,9 +997,11 @@ class DatabaseService {
     const tempAmb: Ambassador = {
       ...data,
       id,
-      fullName: data.fullName || data.name || '',
-      role: data.role || '',
-      country: data.country || '',
+      fullName: (data.fullName || data.name || '').trim(),
+      passportNumber: sanitizePassport(data.passportNumber),
+      rgDni: sanitizeRG_DNI(data.rgDni),
+      role: (data.role || '').trim(),
+      country: (data.country || '').trim(),
       shortBiography: data.shortBiography || '',
       fullBiography: data.fullBiography || '',
       photo: data.photo || '',
@@ -929,11 +1034,24 @@ class DatabaseService {
     const idx = this.data.ambassadors.findIndex((a) => a.id === id);
     if (idx === -1) throw new Error('Ambassador not found');
 
+    if (updates.cpf !== undefined && !validateCPF(updates.cpf)) {
+      throw new Error('CPF informado é inválido. Verifique os dígitos informados.');
+    }
+    if (updates.email !== undefined && !validateEmail(updates.email)) {
+      throw new Error('Endereço de e-mail informado é inválido.');
+    }
+    if (updates.birthDate !== undefined) {
+      const bd = validateBirthDate(updates.birthDate);
+      if (!bd.valid) throw new Error(bd.message || 'Data de nascimento inválida.');
+    }
+
     const prev = { ...this.data.ambassadors[idx] };
     const merged: Ambassador = {
       ...prev,
       ...updates,
-      fullName: updates.fullName !== undefined ? updates.fullName : (prev.fullName || prev.name || ''),
+      fullName: updates.fullName !== undefined ? updates.fullName.trim() : (prev.fullName || prev.name || ''),
+      passportNumber: updates.passportNumber !== undefined ? sanitizePassport(updates.passportNumber) : prev.passportNumber,
+      rgDni: updates.rgDni !== undefined ? sanitizeRG_DNI(updates.rgDni) : prev.rgDni,
       updatedAt: new Date().toISOString(),
     };
 
@@ -975,6 +1093,7 @@ class DatabaseService {
     const amb = this.data.ambassadors.find((a) => a.id === id);
     if (!amb) throw new Error('Ambassador not found');
 
+    const isRegeneration = Boolean(amb.onboardingToken && amb.tokenStatus === 'active');
     const token = crypto.randomBytes(24).toString('hex');
     const createdAt = new Date().toISOString();
     const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -984,16 +1103,19 @@ class DatabaseService {
     amb.tokenExpiresAt = expiresAt;
     amb.tokenStatus = 'active';
 
-    if (amb.onboardingStatus === 'novo') {
-      amb.onboardingStatus = 'link_enviado';
-    }
-
+    // Status do onboarding NÃO é alterado automaticamente para 'link_enviado' ao gerar o token
+    // Preserva o status atual (ex: 'novo', 'analisando', etc.)
     amb.updatedAt = new Date().toISOString();
     this.save();
 
-    this.recordAuditLog(user, 'Alteração', 'Ambassadors', amb.fullName || id, `Link seguro de onboarding gerado para "${amb.fullName}"`, meta);
+    const actionName = isRegeneration ? 'Regeneração de Link' : 'Geração de Link';
+    const actionText = isRegeneration
+      ? `Link externo de onboarding regenerado para "${amb.fullName || id}". Link anterior invalidado.`
+      : `Link externo de onboarding gerado para "${amb.fullName || id}".`;
 
-    return { token, url: `/ambassador-onboarding/${token}`, expiresAt };
+    this.recordAuditLog(user, actionName, 'Ambassadors', amb.fullName || id, actionText, meta);
+
+    return { token, url: `/#ambassador-onboarding?token=${token}`, expiresAt };
   }
 
   public revokeAmbassadorOnboardingToken(id: string, user: User, meta?: RequestMetadata): boolean {
@@ -1004,7 +1126,14 @@ class DatabaseService {
     amb.updatedAt = new Date().toISOString();
     this.save();
 
-    this.recordAuditLog(user, 'Alteração', 'Ambassadors', amb.fullName || id, `Link de onboarding revogado para "${amb.fullName}"`, meta);
+    this.recordAuditLog(
+      user,
+      'Revogação de Link',
+      'Ambassadors',
+      amb.fullName || id,
+      `Link externo de onboarding revogado para "${amb.fullName || id}". Acesso externo bloqueado.`,
+      meta
+    );
     return true;
   }
 
@@ -1030,17 +1159,28 @@ class DatabaseService {
     };
   }
 
-  public updateAmbassadorByToken(token: string, updates: Partial<Ambassador>, submitForAnalysis = false): Ambassador {
+  public updateAmbassadorByToken(token: string, updates: Partial<Ambassador>, submitForAnalysis = false, meta?: RequestMetadata): Ambassador {
     const amb = this.getAmbassadorByOnboardingToken(token);
     if (!amb) throw new Error('Link de onboarding inválido ou expirado');
+
+    if (updates.cpf !== undefined && !validateCPF(updates.cpf)) {
+      throw new Error('CPF informado é inválido. Verifique os dígitos informados.');
+    }
+    if (updates.email !== undefined && !validateEmail(updates.email)) {
+      throw new Error('Endereço de e-mail informado é inválido.');
+    }
+    if (updates.birthDate !== undefined) {
+      const bd = validateBirthDate(updates.birthDate);
+      if (!bd.valid) throw new Error(bd.message || 'Data de nascimento inválida.');
+    }
 
     const idx = this.data.ambassadors.findIndex((a) => a.id === amb.id);
 
     const allowed = {
-      fullName: updates.fullName !== undefined ? updates.fullName : amb.fullName,
-      passportNumber: updates.passportNumber !== undefined ? updates.passportNumber : amb.passportNumber,
+      fullName: updates.fullName !== undefined ? updates.fullName.trim() : amb.fullName,
+      passportNumber: updates.passportNumber !== undefined ? sanitizePassport(updates.passportNumber) : amb.passportNumber,
       cpf: updates.cpf !== undefined ? updates.cpf : amb.cpf,
-      rgDni: updates.rgDni !== undefined ? updates.rgDni : amb.rgDni,
+      rgDni: updates.rgDni !== undefined ? sanitizeRG_DNI(updates.rgDni) : amb.rgDni,
       birthDate: updates.birthDate !== undefined ? updates.birthDate : amb.birthDate,
       bloodType: updates.bloodType !== undefined ? updates.bloodType : amb.bloodType,
       fatherName: updates.fatherName !== undefined ? updates.fatherName : amb.fatherName,
@@ -1068,6 +1208,31 @@ class DatabaseService {
 
     this.data.ambassadors[idx] = merged;
     this.save();
+
+    // Record minimal safe audit log for external candidate onboarding submission
+    const userMeta: User = {
+      id: 'system-onboarding-candidate',
+      name: merged.fullName || 'Candidato Externo',
+      email: merged.email || 'candidato.externo@onboarding',
+      role: 'viewer',
+      permissions: {} as any,
+      status: 'active',
+      joinedAt: new Date().toISOString(),
+      lastLoginAt: new Date().toISOString(),
+    };
+
+    const actionText = submitForAnalysis
+      ? `Onboarding submetido para análise pelo candidato externo (ID: ${merged.id})`
+      : `Ficha de onboarding atualizada pelo candidato externo (ID: ${merged.id})`;
+
+    this.recordAuditLog(
+      userMeta,
+      submitForAnalysis ? ('Submissão de Onboarding' as any) : 'Alteração',
+      'Ambassadors',
+      merged.fullName || merged.id,
+      actionText,
+      meta
+    );
 
     return merged;
   }
@@ -1117,6 +1282,107 @@ class DatabaseService {
     return true;
   }
 
+  // --- DOCUMENT VALIDATION (AI ASSISTED) ---
+
+  public saveDocumentValidation(
+    ambassadorId: string,
+    validation: DocumentValidationRecord,
+    user: User,
+    isReanalysis = false,
+    meta?: RequestMetadata
+  ): Ambassador {
+    const idx = this.data.ambassadors.findIndex((a) => a.id === ambassadorId);
+    if (idx === -1) throw new Error('Ambassador not found');
+
+    const amb = this.data.ambassadors[idx];
+    if (!amb.documentValidations) amb.documentValidations = [];
+
+    // Replace any previous validation for the same documentId
+    amb.documentValidations = amb.documentValidations.filter((v) => v.documentId !== validation.documentId);
+    amb.documentValidations.push(validation);
+    amb.updatedAt = new Date().toISOString();
+
+    this.save();
+
+    const actionType = isReanalysis ? 'REANÁLISE DOCUMENTAL EXECUTADA' : 'VALIDAÇÃO DOCUMENTAL EXECUTADA';
+    const details = `Validação assistida por IA executada para o documento "${validation.documentOriginalName}" (${validation.documentType}). Resultado: ${validation.summary.matchingCount} confere(m), ${validation.summary.divergenceCount} divergência(s).`;
+
+    this.recordAuditLog(user, actionType, 'Ambassadors', amb.fullName || ambassadorId, details, meta);
+
+    return amb;
+  }
+
+  public applyDocumentFieldValueToAmbassador(
+    ambassadorId: string,
+    documentId: string,
+    fieldName: 'fullName' | 'cpf' | 'rgDni' | 'passportNumber' | 'birthDate',
+    user: User,
+    meta?: RequestMetadata
+  ): Ambassador {
+    const idx = this.data.ambassadors.findIndex((a) => a.id === ambassadorId);
+    if (idx === -1) throw new Error('Ambassador not found');
+
+    const amb = this.data.ambassadors[idx];
+    const validation = (amb.documentValidations || []).find((v) => v.documentId === documentId);
+    if (!validation) throw new Error('Registro de validação não localizado');
+
+    const field = validation.fields.find((f) => f.fieldName === fieldName);
+    if (!field || !field.extractedValue) {
+      throw new Error('Valor extraído não disponível para este campo');
+    }
+
+    // Apply the value to the ambassador profile
+    (amb as any)[fieldName] = field.extractedValue;
+    field.result = 'CONFERE';
+    field.registeredValue = field.extractedValue;
+    field.notes = `Atualizado pelo administrador com base no documento "${validation.documentOriginalName}" em ${new Date().toLocaleDateString()}`;
+
+    // Recalculate summary
+    validation.summary.matchingCount = validation.fields.filter((f) => f.result === 'CONFERE').length;
+    validation.summary.divergenceCount = validation.fields.filter((f) => f.result === 'DIVERGÊNCIA ENCONTRADA').length;
+
+    amb.updatedAt = new Date().toISOString();
+    const { completionPercentage, pendingItems } = this.computeAmbassadorCompletion(amb);
+    amb.completionPercentage = completionPercentage;
+    amb.pendingItems = pendingItems;
+
+    this.save();
+
+    const details = `Campo "${field.fieldLabel}" atualizado para o valor identificado no documento "${validation.documentOriginalName}".`;
+    this.recordAuditLog(user, 'ALTERAÇÃO CADASTRAL A PARTIR DE DOCUMENTO', 'Ambassadors', amb.fullName || ambassadorId, details, meta);
+
+    return amb;
+  }
+
+  public markDivergenceReviewed(
+    ambassadorId: string,
+    documentId: string,
+    fieldName: string,
+    notes: string | undefined,
+    user: User,
+    meta?: RequestMetadata
+  ): Ambassador {
+    const idx = this.data.ambassadors.findIndex((a) => a.id === ambassadorId);
+    if (idx === -1) throw new Error('Ambassador not found');
+
+    const amb = this.data.ambassadors[idx];
+    const validation = (amb.documentValidations || []).find((v) => v.documentId === documentId);
+    if (!validation) throw new Error('Registro de validação não localizado');
+
+    const field = validation.fields.find((f) => f.fieldName === fieldName);
+    if (field) {
+      field.notes = notes || `Divergência revisada e mantida pelo administrador em ${new Date().toLocaleDateString()}`;
+    }
+
+    amb.updatedAt = new Date().toISOString();
+    this.save();
+
+    const details = `Divergência no campo "${field?.fieldLabel || fieldName}" revisada e confirmada pelo administrador.`;
+    this.recordAuditLog(user, 'DIVERGÊNCIA REVISADA', 'Ambassadors', amb.fullName || ambassadorId, details, meta);
+
+    return amb;
+  }
+
   public updatePrivateDocument(ambId: string, docId: string, updates: Partial<PrivateDocument>): boolean {
     const idx = this.data.ambassadors.findIndex((a) => a.id === ambId);
     if (idx === -1) return false;
@@ -1135,6 +1401,200 @@ class DatabaseService {
     amb.updatedAt = new Date().toISOString();
     this.save();
     return true;
+  }
+
+  // --- COUNTRY DOCUMENT RULES (ADMIN & DYNAMIC ONBOARDING) ---
+
+  public getCountryDocumentRules(countryIso?: string, includeInactive = false): CountryDocumentRule[] {
+    let rules = this.data.countryDocumentRules || [];
+    if (!includeInactive) {
+      rules = rules.filter((r) => r.isActive);
+    }
+    if (countryIso && countryIso !== 'all') {
+      const iso = countryIso.toUpperCase();
+      rules = rules.filter((r) => r.countryIso.toUpperCase() === iso);
+    }
+    return [...rules].sort((a, b) => a.orderIndex - b.orderIndex);
+  }
+
+  public getApplicableRulesForCountry(countryNameOrIso?: string): CountryDocumentRule[] {
+    const allRules = this.data.countryDocumentRules || [];
+    const activeRules = allRules.filter((r) => r.isActive);
+
+    const iso = normalizeCountryIso(countryNameOrIso);
+
+    // 1. Try matching by specific country ISO
+    if (iso !== 'DEFAULT') {
+      const countrySpecificRules = activeRules.filter((r) => r.countryIso.toUpperCase() === iso);
+      if (countrySpecificRules.length > 0) {
+        return countrySpecificRules.sort((a, b) => a.orderIndex - b.orderIndex);
+      }
+    }
+
+    // 2. Try matching by country name string directly if ISO wasn't mapped
+    if (countryNameOrIso) {
+      const normalizedQuery = countryNameOrIso.trim().toLowerCase();
+      const directNameMatches = activeRules.filter(
+        (r) => r.country.toLowerCase() === normalizedQuery || r.countryIso.toLowerCase() === normalizedQuery
+      );
+      if (directNameMatches.length > 0) {
+        return directNameMatches.sort((a, b) => a.orderIndex - b.orderIndex);
+      }
+    }
+
+    // 3. Fallback to DEFAULT international rules
+    const defaultRules = activeRules.filter((r) => r.countryIso === 'DEFAULT');
+    if (defaultRules.length > 0) {
+      return defaultRules.sort((a, b) => a.orderIndex - b.orderIndex);
+    }
+
+    // 4. Absolute fallback to INITIAL_COUNTRY_DOCUMENT_RULES defaults
+    return INITIAL_COUNTRY_DOCUMENT_RULES.filter((r) => r.countryIso === 'DEFAULT');
+  }
+
+  public createCountryDocumentRule(
+    ruleData: Partial<CountryDocumentRule>,
+    user: User,
+    meta?: RequestMetadata
+  ): CountryDocumentRule {
+    if (!ruleData.country || !ruleData.documentName || !ruleData.documentCode) {
+      throw new Error('País, nome do documento e código do documento são obrigatórios.');
+    }
+
+    const iso = (ruleData.countryIso || normalizeCountryIso(ruleData.country)).toUpperCase();
+    const existingRules = this.data.countryDocumentRules || [];
+
+    const newRule: CountryDocumentRule = {
+      id: `rule-${iso.toLowerCase()}-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`,
+      country: ruleData.country.trim(),
+      countryIso: iso,
+      documentCode: ruleData.documentCode.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_'),
+      documentName: ruleData.documentName.trim(),
+      description: ruleData.description || '',
+      isRequired: Boolean(ruleData.isRequired),
+      category: ruleData.category || 'identification',
+      allowedFormats: Array.isArray(ruleData.allowedFormats) && ruleData.allowedFormats.length > 0
+        ? ruleData.allowedFormats
+        : ['application/pdf', 'image/jpeg', 'image/png'],
+      validityRequired: Boolean(ruleData.validityRequired),
+      candidateInstructions: ruleData.candidateInstructions || '',
+      isActive: ruleData.isActive !== false,
+      orderIndex: typeof ruleData.orderIndex === 'number' ? ruleData.orderIndex : existingRules.length + 1,
+      sourceType: ruleData.sourceType || 'UNKNOWN',
+      sourceReference: ruleData.sourceReference?.trim() || undefined,
+      administrativeNotes: ruleData.administrativeNotes?.trim() || undefined,
+      translations: ruleData.translations || {
+        pt: {
+          name: ruleData.documentName,
+          description: ruleData.description || '',
+          candidateInstructions: ruleData.candidateInstructions || '',
+        },
+      },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (!this.data.countryDocumentRules) {
+      this.data.countryDocumentRules = [];
+    }
+    this.data.countryDocumentRules.push(newRule);
+    this.save();
+
+    this.recordAuditLog(
+      user,
+      'Criação',
+      'Ambassadors',
+      newRule.id,
+      `Regra documental criada para o país ${newRule.country} (${newRule.countryIso}): ${newRule.documentName}`,
+      meta
+    );
+
+    return newRule;
+  }
+
+  public updateCountryDocumentRule(
+    id: string,
+    updates: Partial<CountryDocumentRule>,
+    user: User,
+    meta?: RequestMetadata
+  ): CountryDocumentRule {
+    const rules = this.data.countryDocumentRules || [];
+    const index = rules.findIndex((r) => r.id === id);
+    if (index === -1) {
+      throw new Error(`Regra documental com ID "${id}" não encontrada.`);
+    }
+
+    const current = rules[index];
+    const updated: CountryDocumentRule = {
+      ...current,
+      ...updates,
+      countryIso: updates.countryIso ? updates.countryIso.toUpperCase() : current.countryIso,
+      updatedAt: new Date().toISOString(),
+    };
+
+    rules[index] = updated;
+    this.save();
+
+    this.recordAuditLog(
+      user,
+      'Alteração',
+      'Ambassadors',
+      id,
+      `Regra documental "${updated.documentName}" do país ${updated.country} atualizada`,
+      meta
+    );
+
+    return updated;
+  }
+
+  public deleteCountryDocumentRule(id: string, user: User, meta?: RequestMetadata): boolean {
+    const rules = this.data.countryDocumentRules || [];
+    const rule = rules.find((r) => r.id === id);
+    if (!rule) {
+      return false;
+    }
+
+    this.data.countryDocumentRules = rules.filter((r) => r.id !== id);
+    this.save();
+
+    this.recordAuditLog(
+      user,
+      'Exclusão',
+      'Ambassadors',
+      id,
+      `Regra documental "${rule.documentName}" do país ${rule.country} removida`,
+      meta
+    );
+
+    return true;
+  }
+
+  public reorderCountryDocumentRules(orderedIds: string[], user: User, meta?: RequestMetadata): CountryDocumentRule[] {
+    const rules = this.data.countryDocumentRules || [];
+    const map = new Map<string, CountryDocumentRule>();
+    rules.forEach((r) => map.set(r.id, r));
+
+    let index = 1;
+    orderedIds.forEach((id) => {
+      const r = map.get(id);
+      if (r) {
+        r.orderIndex = index++;
+      }
+    });
+
+    rules.sort((a, b) => a.orderIndex - b.orderIndex);
+    this.save();
+
+    this.recordAuditLog(
+      user,
+      'Alteração',
+      'Ambassadors',
+      'rules-reorder',
+      'Reordenamento de regras documentais por país realizado',
+      meta
+    );
+
+    return rules;
   }
 
   // --- MEDIA LIBRARY ---
@@ -1875,14 +2335,56 @@ class DatabaseService {
 
     const matchesUrlOrName = (str?: string) => {
       if (!str) return false;
-      return (url && str.includes(url)) || (filename && str.includes(filename)) || (id && str.includes(id));
+      return (
+        (url && str.includes(url)) ||
+        (filename && str.includes(filename)) ||
+        (id && str.includes(id)) ||
+        (asset.storageKey && str.includes(asset.storageKey))
+      );
     };
 
     // 1. Settings / Home / Header
     if (this.data.settings) {
       const s = this.data.settings;
-      if (matchesUrlOrName(s.heroBgImage)) {
-        locations.push({ module: 'Home / Navegação', entityTitle: 'Header / Sessão Hero Principal', field: 'Imagem de Fundo Hero', pageUrl: '/' });
+      for (const [key, val] of Object.entries(s)) {
+        if (typeof val === 'string' && matchesUrlOrName(val)) {
+          locations.push({ module: 'Home / Configurações', entityTitle: 'Configurações Institucionais do Site', field: `Campo ${key}`, pageUrl: '/' });
+        }
+      }
+      if (s.translations) {
+        for (const lang of ['pt', 'en', 'es'] as const) {
+          const tr = s.translations[lang];
+          if (tr) {
+            for (const [key, val] of Object.entries(tr)) {
+              if (typeof val === 'string' && matchesUrlOrName(val)) {
+                locations.push({ module: 'Home / Configurações', entityTitle: `Tradução (${lang.toUpperCase()})`, field: `Campo ${key}`, pageUrl: '/' });
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 1b. Maintenance Settings
+    if (this.data.maintenanceSettings) {
+      const ms = this.data.maintenanceSettings;
+      if (ms.global) {
+        if (matchesUrlOrName(ms.global.customLogoUrl)) {
+          locations.push({ module: 'Central de Manutenção', entityTitle: 'Configuração Global de Manutenção', field: 'Logo Customizado', pageUrl: '/maintenance' });
+        }
+        if (matchesUrlOrName(ms.global.customImageUrl)) {
+          locations.push({ module: 'Central de Manutenção', entityTitle: 'Configuração Global de Manutenção', field: 'Imagem de Destaque', pageUrl: '/maintenance' });
+        }
+      }
+      if (ms.pages) {
+        for (const [pageKey, pConfig] of Object.entries(ms.pages)) {
+          if (pConfig && matchesUrlOrName(pConfig.customLogoUrl)) {
+            locations.push({ module: 'Central de Manutenção', entityTitle: `Página Manutenção: ${pageKey}`, field: 'Logo Customizado', pageUrl: '/maintenance' });
+          }
+          if (pConfig && matchesUrlOrName(pConfig.customImageUrl)) {
+            locations.push({ module: 'Central de Manutenção', entityTitle: `Página Manutenção: ${pageKey}`, field: 'Imagem de Destaque', pageUrl: '/maintenance' });
+          }
+        }
       }
     }
 
@@ -1891,6 +2393,14 @@ class DatabaseService {
       for (const amb of this.data.ambassadors) {
         if (matchesUrlOrName(amb.photo)) {
           locations.push({ module: 'Embaixadores', entityId: amb.id, entityTitle: `Embaixador ${amb.fullName || amb.name}`, field: 'Foto Pública de Perfil', pageUrl: '/ambassadors' });
+        }
+        if (amb.translations) {
+          for (const lang of ['pt', 'en', 'es'] as const) {
+            const tr = amb.translations[lang];
+            if (tr && matchesUrlOrName(tr.bio)) {
+              locations.push({ module: 'Embaixadores', entityId: amb.id, entityTitle: `Embaixador ${amb.fullName || amb.name} (${lang.toUpperCase()})`, field: 'Biografia Traduzida', pageUrl: '/ambassadors' });
+            }
+          }
         }
       }
     }
@@ -1909,6 +2419,17 @@ class DatabaseService {
             if (matchesUrlOrName(gUrl)) {
               locations.push({ module: 'Programas', entityId: prog.id, entityTitle: `Programa: ${prog.title}`, field: 'Galeria de Fotos', pageUrl: '/programs' });
               break;
+            }
+          }
+        }
+        if (matchesUrlOrName(prog.fullDescription)) {
+          locations.push({ module: 'Programas', entityId: prog.id, entityTitle: `Programa: ${prog.title}`, field: 'Descrição Detalhada', pageUrl: '/programs' });
+        }
+        if (prog.translations) {
+          for (const lang of ['pt', 'en', 'es'] as const) {
+            const tr = prog.translations[lang];
+            if (tr && matchesUrlOrName(tr.fullDescription)) {
+              locations.push({ module: 'Programas', entityId: prog.id, entityTitle: `Programa: ${prog.title} (${lang.toUpperCase()})`, field: 'Descrição Traduzida', pageUrl: '/programs' });
             }
           }
         }
@@ -1935,6 +2456,14 @@ class DatabaseService {
             }
           }
         }
+        if (story.translations) {
+          for (const lang of ['pt', 'en', 'es'] as const) {
+            const tr = story.translations[lang];
+            if (tr && matchesUrlOrName(tr.fullText || tr.fullContent)) {
+              locations.push({ module: 'Notícias', entityId: story.id, entityTitle: `Notícia: ${story.headline || story.title} (${lang.toUpperCase()})`, field: 'Texto Traduzido', pageUrl: '/news' });
+            }
+          }
+        }
       }
     }
 
@@ -1946,6 +2475,20 @@ class DatabaseService {
         }
         if (asset.albumId === alb.id) {
           locations.push({ module: 'Galeria', entityId: alb.id, entityTitle: `Álbum: ${alb.title}`, field: 'Foto do Álbum', pageUrl: '/media' });
+        }
+      }
+    }
+
+    // 6. Tasks
+    if (this.data.tasks) {
+      for (const task of this.data.tasks) {
+        if (Array.isArray(task.attachments)) {
+          for (const att of task.attachments) {
+            if (matchesUrlOrName(att.url) || att.mediaId === id) {
+              locations.push({ module: 'Tarefas / Kanban', entityId: task.id, entityTitle: `Tarefa: ${task.title}`, field: 'Anexo de Mídia', pageUrl: '/tasks' });
+              break;
+            }
+          }
         }
       }
     }
@@ -1987,9 +2530,57 @@ class DatabaseService {
     // 1. Settings
     if (this.data.settings) {
       const s = this.data.settings;
-      if (s.heroBgImage) {
-        const { newStr, changed } = replaceStr(s.heroBgImage);
-        if (changed) { s.heroBgImage = newStr; updatedCount++; }
+      for (const [key, val] of Object.entries(s)) {
+        if (typeof val === 'string') {
+          const { newStr, changed } = replaceStr(val);
+          if (changed) {
+            (s as any)[key] = newStr;
+            updatedCount++;
+          }
+        }
+      }
+      if (s.translations) {
+        for (const lang of ['pt', 'en', 'es'] as const) {
+          const tr = s.translations[lang];
+          if (tr) {
+            for (const [key, val] of Object.entries(tr)) {
+              if (typeof val === 'string') {
+                const { newStr, changed } = replaceStr(val);
+                if (changed) {
+                  (tr as any)[key] = newStr;
+                  updatedCount++;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 1b. Maintenance Settings
+    if (this.data.maintenanceSettings) {
+      const ms = this.data.maintenanceSettings;
+      if (ms.global) {
+        if (ms.global.customLogoUrl) {
+          const { newStr, changed } = replaceStr(ms.global.customLogoUrl);
+          if (changed) { ms.global.customLogoUrl = newStr; updatedCount++; }
+        }
+        if (ms.global.customImageUrl) {
+          const { newStr, changed } = replaceStr(ms.global.customImageUrl);
+          if (changed) { ms.global.customImageUrl = newStr; updatedCount++; }
+        }
+      }
+      if (ms.pages) {
+        for (const pConfig of Object.values(ms.pages)) {
+          if (pConfig.customLogoUrl) {
+            const { newStr, changed } = replaceStr(pConfig.customLogoUrl);
+            if (changed) { pConfig.customLogoUrl = newStr; updatedCount++; }
+          }
+          if (pConfig.customImageUrl) {
+            const { newStr, changed } = replaceStr(pConfig.customImageUrl);
+            if (changed) { pConfig.customImageUrl = newStr; updatedCount++; }
+          }
+        }
       }
     }
 
@@ -2027,6 +2618,25 @@ class DatabaseService {
           const { newStr, changed } = replaceStr(prog.fullDescription);
           if (changed) { prog.fullDescription = newStr; updatedCount++; }
         }
+        if (prog.translations) {
+          for (const lang of ['pt', 'en', 'es'] as const) {
+            const tr = prog.translations[lang] as any;
+            if (tr) {
+              if (tr.featuredImage) {
+                const { newStr, changed } = replaceStr(tr.featuredImage);
+                if (changed) { tr.featuredImage = newStr; updatedCount++; }
+              }
+              if (tr.heroImage) {
+                const { newStr, changed } = replaceStr(tr.heroImage);
+                if (changed) { tr.heroImage = newStr; updatedCount++; }
+              }
+              if (tr.fullDescription) {
+                const { newStr, changed } = replaceStr(tr.fullDescription);
+                if (changed) { tr.fullDescription = newStr; updatedCount++; }
+              }
+            }
+          }
+        }
       }
     }
 
@@ -2054,6 +2664,21 @@ class DatabaseService {
           });
           if (galChanged) updatedCount++;
         }
+        if (story.translations) {
+          for (const lang of ['pt', 'en', 'es'] as const) {
+            const tr = story.translations[lang] as any;
+            if (tr) {
+              if (tr.featuredPhoto) {
+                const { newStr, changed } = replaceStr(tr.featuredPhoto);
+                if (changed) { tr.featuredPhoto = newStr; updatedCount++; }
+              }
+              if (tr.fullText) {
+                const { newStr, changed } = replaceStr(tr.fullText);
+                if (changed) { tr.fullText = newStr; updatedCount++; }
+              }
+            }
+          }
+        }
       }
     }
 
@@ -2067,6 +2692,24 @@ class DatabaseService {
         if (alb.coverMediaId === sourceId) {
           alb.coverMediaId = targetId;
           updatedCount++;
+        }
+      }
+    }
+
+    // 6. Tasks
+    if (this.data.tasks) {
+      for (const task of this.data.tasks) {
+        if (Array.isArray(task.attachments)) {
+          for (const att of task.attachments) {
+            if (att.url) {
+              const { newStr, changed } = replaceStr(att.url);
+              if (changed) { att.url = newStr; updatedCount++; }
+            }
+            if (att.mediaId === sourceId) {
+              att.mediaId = targetId;
+              updatedCount++;
+            }
+          }
         }
       }
     }
@@ -2117,38 +2760,74 @@ class DatabaseService {
     targetMediaIds: string[],
     user?: User,
     meta?: RequestMetadata
-  ): { success: boolean; masterMedia: MediaAsset; updatedReferencesCount: number; message: string } {
+  ): { success: boolean; masterMedia: MediaAsset; updatedReferencesCount: number; message: string; warnings?: string[] } {
     const master = this.data.media.find((m) => m.id === masterMediaId);
     if (!master) throw new Error('Mídia mestre não encontrada.');
 
     let totalUpdatedRefs = 0;
     const consolidatedIds: string[] = [];
+    const warnings: string[] = [];
 
     for (const tid of targetMediaIds) {
       if (tid === masterMediaId) continue;
       const target = this.data.media.find((m) => m.id === tid);
       if (!target || target.isDeleted) continue;
 
+      // Check aspect ratio / dimensions compatibility
+      if (master.dimensions && target.dimensions) {
+        const parseDims = (d: string) => {
+          const parts = d.split('x').map((p) => parseInt(p.trim(), 10));
+          return parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1]) ? { w: parts[0], h: parts[1] } : null;
+        };
+        const masterD = parseDims(master.dimensions);
+        const targetD = parseDims(target.dimensions);
+        if (masterD && targetD) {
+          const masterRatio = masterD.w / masterD.h;
+          const targetRatio = targetD.w / targetD.h;
+          if (Math.abs(masterRatio - targetRatio) > 0.35) {
+            warnings.push(
+              `Atenção: Proporção de imagem divergente entre mestre (${master.dimensions}) e ${target.originalName} (${target.dimensions}). A configuração visual das entidades foi preservada.`
+            );
+          }
+        }
+      }
+
       // 1. Migrate References
       const refsCount = this.replaceMediaReferences(target, master, user, meta);
       totalUpdatedRefs += refsCount;
 
-      // 2. Mark as consolidated and move to Trash
-      target.duplicateStatus = 'confirmed_duplicate';
-      target.duplicateOfId = masterMediaId;
-      
-      // Perform real soft-delete
-      this.softDeleteMedia(target.id, user, {
-        ...meta,
-        reason: `Consolidado no arquivo mestre ${masterMediaId}`
-      } as any);
-      
-      consolidatedIds.push(tid);
+      // Save migration before zero-reference verification
+      this.save();
+
+      // 2. ZERO-REFERENCE GATE: Re-evaluate remaining references for target!
+      const remainingLocations = this.getMediaUsageLocations(target);
+
+      if (remainingLocations.length > 0) {
+        // Rule 2: DO NOT delete, DO NOT move to trash if references still exist!
+        warnings.push(`Consolidação incompleta — ainda existem ${remainingLocations.length} referência(s) para a mídia "${target.originalName || target.id}".`);
+        target.duplicateStatus = 'confirmed_duplicate';
+        target.duplicateOfId = masterMediaId;
+        // DO NOT call softDeleteMedia!
+      } else {
+        // ZERO REFERENCES CONFIRMED!
+        target.duplicateStatus = 'confirmed_duplicate';
+        target.duplicateOfId = masterMediaId;
+        
+        // Perform soft-delete (move to trash)
+        this.softDeleteMedia(target.id, user, {
+          ...meta,
+          reason: `Consolidado no arquivo mestre ${masterMediaId}`
+        } as any);
+        
+        consolidatedIds.push(tid);
+      }
     }
 
+    // Preserve Master Active
     master.duplicateStatus = 'keep_both';
+    master.isDeleted = false;
 
-    // 3. Remove from DuplicateGroups
+    // 3. Update DuplicateGroups
     if (this.data.duplicateGroups) {
       this.data.duplicateGroups = this.data.duplicateGroups.filter((g) => {
         const hasTarget = g.mediaIds.some((id) => consolidatedIds.includes(id));
@@ -2168,16 +2847,22 @@ class DatabaseService {
         'Consolidação de Mídia' as any,
         'Photos',
         master.title || master.originalName,
-        `Consolidação concluída: ${consolidatedIds.length} arquivo(s) redundantes migrados e movidos para a Lixeira. ${totalUpdatedRefs} referência(s) atualizada(s) para o mestre "${master.originalName}".`,
+        `Consolidação de mídia realizada: ${consolidatedIds.length} redundância(s) consolidadas e movidas para a Lixeira. ${totalUpdatedRefs} referência(s) migrada(s) para o mestre "${master.originalName}". ${warnings.length > 0 ? warnings.join(' | ') : ''}`,
         meta
       );
     }
 
+    const isFullySuccessful = consolidatedIds.length === targetMediaIds.filter(id => id !== masterMediaId).length;
+    const successMessage = consolidatedIds.length > 0
+      ? `Consolidação realizada com sucesso. ${totalUpdatedRefs} referência(s) migrada(s) para o arquivo mestre "${master.originalName}".`
+      : `Consolidação iniciada. Nenhuma mídia foi movida para a Lixeira devido a referências pendentes.`;
+
     return {
-      success: true,
+      success: isFullySuccessful,
       masterMedia: master,
       updatedReferencesCount: totalUpdatedRefs,
-      message: `Consolidação realizada com sucesso. ${totalUpdatedRefs} referência(s) migrada(s) para o arquivo mestre "${master.originalName}".`,
+      message: warnings.length > 0 ? `${successMessage} ${warnings.join(' ')}` : successMessage,
+      warnings,
     };
   }
 
@@ -2233,6 +2918,10 @@ class DatabaseService {
     mediaB: MediaAsset;
     mediaC: MediaAsset;
   } {
+    if (process.env.NODE_ENV === 'production' || process.env.APP_ENV === 'production') {
+      throw new Error('Acesso negado: Criação de cenários e dados de teste é estritamente proibida no ambiente de Produção.');
+    }
+
     const now = new Date().toISOString();
     const sharedSha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
     const sharedUrl = 'https://picsum.photos/id/1050/800/600';

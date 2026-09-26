@@ -4,6 +4,7 @@ import { useSite } from '../../context/SiteContext';
 import { useToast } from '../../context/ToastContext';
 import { useTranslation } from '../../i18n/useTranslation';
 import { api } from '../../lib/api';
+import { PrivacyNotice } from './PrivacyNotice';
 
 const PRESET_AMOUNTS = [25, 50, 100, 250, 500];
 
@@ -297,6 +298,8 @@ export function DonationModal() {
               <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
               <span>{t('donate.securityAssurance')}</span>
             </div>
+
+            <PrivacyNotice context="donations" theme="light" variant="compact" />
 
             {/* Submit Button */}
             <button

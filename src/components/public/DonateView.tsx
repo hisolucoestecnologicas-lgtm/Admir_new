@@ -9,6 +9,7 @@ import { useSite } from '../../context/SiteContext';
 import { useToast } from '../../context/ToastContext';
 import { useTranslation } from '../../i18n/useTranslation';
 import { api } from '../../lib/api';
+import { PrivacyNotice } from '../common/PrivacyNotice';
 
 export function DonateView() {
   const { language } = useSite();
@@ -341,6 +342,8 @@ export function DonateView() {
                     <span>{language === 'pt' ? 'Autorizo publicação do nome institucional nos relatórios de transparência' : language === 'es' ? 'Autorizo publicación del nombre en informes de transparencia' : 'I consent to public transparency listing of my institutional contribution'}</span>
                   </label>
                 </div>
+
+                <PrivacyNotice context="donations" theme="light" variant="compact" />
 
                 {/* Submit */}
                 <button

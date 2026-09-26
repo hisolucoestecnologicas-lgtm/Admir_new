@@ -13,6 +13,7 @@ import { useToast } from '../../context/ToastContext';
 import { useTranslation } from '../../i18n/useTranslation';
 import { getLocalizedSettings } from '../../lib/i18nHelper';
 import { api } from '../../lib/api';
+import { PrivacyNotice } from '../common/PrivacyNotice';
 
 export function ContactView() {
   const { settings, language } = useSite();
@@ -224,6 +225,8 @@ export function ContactView() {
                 className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-xl focus:ring-2 focus:ring-amber-500 focus:outline-none"
               />
             </div>
+
+            <PrivacyNotice context="contact" theme="light" variant="compact" />
 
             <button
               type="submit"

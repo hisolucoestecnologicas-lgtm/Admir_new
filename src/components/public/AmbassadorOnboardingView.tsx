@@ -20,6 +20,15 @@ import {
 import { useSite } from '../../context/SiteContext';
 import { useToast } from '../../context/ToastContext';
 import { api } from '../../lib/api';
+import { PrivacyNotice } from '../common/PrivacyNotice';
+import {
+  maskCPF,
+  validateCPF,
+  formatPhone,
+  validateEmail,
+  validateBirthDate,
+} from '../../utils/validation';
+import { CountryDocumentRule } from '../../types';
 
 export function AmbassadorOnboardingView() {
   const { selectedParam } = useSite();
@@ -30,6 +39,8 @@ export function AmbassadorOnboardingView() {
   const [loading, setLoading] = useState(true);
   const [valid, setValid] = useState(false);
   const [candidate, setCandidate] = useState<any>(null);
+  const [applicableRules, setApplicableRules] = useState<CountryDocumentRule[]>([]);
+  const [selectedRuleId, setSelectedRuleId] = useState<string>('');
   const [saving, setSaving] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [uploadingDoc, setUploadingDoc] = useState(false);
@@ -140,6 +151,12 @@ export function AmbassadorOnboardingView() {
           address: data.address || '',
           curriculumSummary: data.curriculumSummary || '',
         });
+        const rules: CountryDocumentRule[] = data.applicableRules || [];
+        setApplicableRules(rules);
+        if (rules.length > 0) {
+          setSelectedRuleId(rules[0].id);
+          setDocType(rules[0].documentCode);
+        }
         setValid(true);
       } catch (err: any) {
         setValid(false);
@@ -153,11 +170,38 @@ export function AmbassadorOnboardingView() {
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
     const { name, value } = e.target;
-    setForm((prev) => ({ ...prev, [name]: value }));
+    let formattedValue = value;
+    if (name === 'cpf') {
+      formattedValue = maskCPF(value);
+    } else if (name === 'phone') {
+      formattedValue = formatPhone(value);
+    }
+    setForm((prev) => ({ ...prev, [name]: formattedValue }));
+  };
+
+  const validateFormData = (): boolean => {
+    if (form.cpf.trim() && !validateCPF(form.cpf)) {
+      error('CPF Inválido', 'O CPF informado não atende aos dígitos verificadores.');
+      return false;
+    }
+    if (form.email.trim() && !validateEmail(form.email)) {
+      error('E-mail Inválido', 'Informe um endereço de e-mail válido (ex: nome@dominio.com).');
+      return false;
+    }
+    if (form.birthDate.trim()) {
+      const bd = validateBirthDate(form.birthDate);
+      if (!bd.valid) {
+        error('Data de Nascimento Inválida', bd.message || 'Verifique a data informada.');
+        return false;
+      }
+    }
+    return true;
   };
 
   const handleSaveDraft = async () => {
     if (!token) return;
+    if (!validateFormData()) return;
+
     setSaving(true);
     try {
       const updated = await api.updateOnboardingCandidate(token, form, false);
@@ -176,6 +220,7 @@ export function AmbassadorOnboardingView() {
       error('Preenchimento Incompleto', 'Por favor, informe ao menos seu nome completo e e-mail.');
       return;
     }
+    if (!validateFormData()) return;
 
     setSubmitting(true);
     try {
@@ -207,6 +252,8 @@ export function AmbassadorOnboardingView() {
           const base64Data = reader.result as string;
           await api.uploadOnboardingDocument(token, {
             type: docType,
+            ruleId: selectedRuleId || undefined,
+            documentCode: docType,
             fileName: selectedFile.name,
             fileData: base64Data,
             mimeType: selectedFile.type,
@@ -365,6 +412,9 @@ export function AmbassadorOnboardingView() {
           </div>
         )}
 
+        {/* LGPD Privacy Notice for Onboarding */}
+        <PrivacyNotice context="ambassador_onboarding" theme="dark" variant="banner" />
+
         {/* SECTION 1: Personal Data */}
         <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 space-y-6">
           <div className="flex items-center gap-3 border-b border-slate-800 pb-4">
@@ -419,14 +469,14 @@ export function AmbassadorOnboardingView() {
 
             <div className="space-y-1">
               <label className="text-xs font-semibold text-slate-300">
-                Passaporte <span className="text-amber-400">*</span>
+                Passaporte <span className="text-slate-400 font-normal">(opcional)</span>
               </label>
               <input
                 type="text"
                 name="passportNumber"
                 value={form.passportNumber}
                 onChange={handleChange}
-                placeholder="Número do passaporte internacional"
+                placeholder="Número do passaporte (opcional)"
                 className="w-full bg-slate-950 border border-slate-800 focus:border-amber-500 rounded-xl px-3.5 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none font-mono"
               />
             </div>
@@ -581,16 +631,129 @@ export function AmbassadorOnboardingView() {
 
         {/* SECTION 3: Private Document Attachments */}
         <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 space-y-6">
-          <div className="flex items-center gap-3 border-b border-slate-800 pb-4">
-            <Upload className="w-5 h-5 text-amber-400" />
-            <h2 className="text-lg font-bold font-serif-heading text-white">
-              3. Documentos Comprobatórios Privados
-            </h2>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-4">
+            <div className="flex items-center gap-3">
+              <Upload className="w-5 h-5 text-amber-400" />
+              <h2 className="text-lg font-bold font-serif-heading text-white">
+                3. Documentos Comprobatórios Privados
+              </h2>
+            </div>
+            <div className="inline-flex items-center gap-2 px-3 py-1 bg-slate-950 border border-slate-800 rounded-full text-[11px] text-slate-300">
+              <Globe className="w-3.5 h-3.5 text-amber-400" />
+              <span>País do Cadastro: <strong className="text-white">{candidate.country || 'Padrão Internacional'}</strong></span>
+            </div>
           </div>
 
-          <p className="text-xs text-slate-400">
-            Envie cópias legíveis dos seus documentos. Os arquivos são mantidos em diretório privado seguro da ADMIR e não ficam públicos.
-          </p>
+          <PrivacyNotice context="ambassador_docs" theme="dark" variant="compact" />
+
+          {/* DYNAMIC COUNTRY DOCUMENT REQUIREMENTS CHECKLIST */}
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-5 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-800/80 pb-3">
+              <div>
+                <h3 className="text-xs font-bold text-amber-400 uppercase tracking-wider flex items-center gap-2">
+                  <Shield className="w-4 h-4 text-amber-400" />
+                  Requisitos Documentais Internacionais
+                </h3>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  Documentação orientativa para instrução cadastral de representação na ADMIR ({candidate.country || 'Padrão Internacional'}).
+                </p>
+              </div>
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-900 text-slate-400 border border-slate-800">
+                {applicableRules.length} {applicableRules.length === 1 ? 'requisito configurado' : 'requisitos configurados'}
+              </span>
+            </div>
+
+            <div className="space-y-3">
+              {applicableRules.length === 0 ? (
+                <p className="text-xs text-slate-500 italic p-3 bg-slate-900/50 rounded-xl border border-slate-800">
+                  Carregando requisitos aplicáveis ao seu país...
+                </p>
+              ) : (
+                applicableRules.map((rule) => {
+                  const isUploaded = documents.some(
+                    (d: any) =>
+                      d.ruleId === rule.id ||
+                      d.documentCode === rule.documentCode ||
+                      d.type === rule.documentCode ||
+                      (rule.documentCode === 'photo' && ((candidate.photo && candidate.photo.trim().length > 0) || d.type === 'photo')) ||
+                      (rule.documentCode === 'passport' && (d.type === 'passport' || d.type === 'rg'))
+                  );
+
+                  return (
+                    <div
+                      key={rule.id}
+                      className={`p-3.5 rounded-xl border transition-all ${
+                        isUploaded
+                          ? 'bg-emerald-950/20 border-emerald-900/40 text-slate-200'
+                          : rule.isRequired
+                          ? 'bg-slate-900/60 border-amber-500/20 text-slate-300'
+                          : 'bg-slate-900/40 border-slate-800 text-slate-400'
+                      }`}
+                    >
+                      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+                        <div className="flex items-start gap-3">
+                          <div className="mt-0.5 shrink-0">
+                            {isUploaded ? (
+                              <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                            ) : rule.isRequired ? (
+                              <AlertTriangle className="w-4 h-4 text-amber-400" />
+                            ) : (
+                              <Clock className="w-4 h-4 text-slate-500" />
+                            )}
+                          </div>
+                          <div className="space-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-xs font-bold text-white">{rule.documentName}</span>
+                              <span
+                                className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
+                                  rule.isRequired
+                                    ? 'bg-amber-500/15 text-amber-400 border border-amber-500/30'
+                                    : 'bg-slate-800 text-slate-400 border border-slate-700'
+                                }`}
+                              >
+                                {rule.isRequired ? 'Obrigatório no fluxo ADMIR' : 'Opcional / Complementar'}
+                              </span>
+                              <span className="text-[10px] text-slate-400 uppercase tracking-wider font-mono">
+                                ({rule.category})
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-slate-400 leading-relaxed">
+                              {rule.candidateInstructions || rule.description}
+                            </p>
+                            {rule.allowedFormats && rule.allowedFormats.length > 0 && (
+                              <p className="text-[10px] text-slate-500 font-mono">
+                                Formatos aceitos: {rule.allowedFormats.map((f) => f.split('/').pop()?.toUpperCase()).join(', ')}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="shrink-0 flex items-center gap-2 self-end sm:self-center">
+                          {isUploaded ? (
+                            <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded-lg border border-emerald-500/20">
+                              <CheckCircle2 className="w-3.5 h-3.5" /> Anexado
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setDocType(rule.documentCode);
+                                setSelectedRuleId(rule.id);
+                                fileInputRef.current?.click();
+                              }}
+                              className="inline-flex items-center gap-1.5 text-xs font-bold text-amber-400 hover:text-white bg-amber-500/10 hover:bg-amber-600 px-3 py-1.5 rounded-lg border border-amber-500/30 transition-all cursor-pointer"
+                            >
+                              <Upload className="w-3.5 h-3.5" /> Anexar
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
 
           {/* Upload Form */}
           <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 sm:p-5 space-y-5">
@@ -603,18 +766,20 @@ export function AmbassadorOnboardingView() {
                 <select
                   value={docType}
                   onChange={(e) => {
-                    setDocType(e.target.value);
+                    const val = e.target.value;
+                    setDocType(val);
+                    const matchedRule = applicableRules.find((r) => r.documentCode === val);
+                    setSelectedRuleId(matchedRule ? matchedRule.id : '');
                     handleRemoveFile();
                   }}
                   className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-amber-500/50"
                 >
-                  <option value="passport">Cópia do Passaporte</option>
-                  <option value="cpf">Cópia do CPF</option>
-                  <option value="rg">Cópia do RG / DNI</option>
-                  <option value="photo">Fotografia Oficial / Retrato</option>
-                  <option value="blood_type">Comprovante de Tipo Sanguíneo</option>
-                  <option value="curriculum">Currículo Completo (PDF/DOC)</option>
-                  <option value="other">Outro Documento</option>
+                  {applicableRules.map((rule) => (
+                    <option key={rule.id} value={rule.documentCode}>
+                      {rule.documentName} {rule.isRequired ? '(*Obrigatório)' : '(Opcional)'}
+                    </option>
+                  ))}
+                  <option value="other">Outro Documento Comprobatório</option>
                 </select>
               </div>
 
@@ -763,7 +928,7 @@ export function AmbassadorOnboardingView() {
             <h3 className="text-xs font-bold text-slate-300">Documentos Anexados ({documents.length})</h3>
             {documents.length === 0 ? (
               <p className="text-xs text-slate-500 italic bg-slate-950 p-4 rounded-xl border border-slate-800">
-                Nenhum documento anexado até o momento. Por favor, envie as cópias do passaporte, CPF, RG e currículo.
+                Nenhum documento anexado até o momento. Por favor, envie os documentos aplicáveis ao seu cadastro (o passaporte é opcional).
               </p>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">

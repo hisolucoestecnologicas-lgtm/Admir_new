@@ -2,10 +2,68 @@ import { db } from './db';
 import { MediaAsset, MediaAIJob, User } from '../types';
 import { analyzeImageWithGemini } from './aiMediaService';
 import { PublicMediaStorage } from './storage';
-import { GEMINI_MODEL, AI_MEDIA_MIN_DELAY_MS, AI_ANALYSIS_VERSION } from './aiUtils';
+import { GEMINI_MODEL, AI_ANALYSIS_VERSION, aiRateLimiter } from './aiUtils';
 
 let isWorkerRunning = false;
-let lastCallTime = 0;
+
+// Prefetch cache for the efficient pipeline
+interface PrefetchedMedia {
+  mediaId: string;
+  buffer: Buffer;
+  downloadTimeMs: number;
+  prepTimeMs: number;
+}
+
+let prefetchedItem: PrefetchedMedia | null = null;
+let prefetchPromise: Promise<PrefetchedMedia | null> | null = null;
+
+function clearPrefetchCache() {
+  prefetchedItem = null;
+  prefetchPromise = null;
+}
+
+async function prefetchNextMedia(nextMediaId: string): Promise<PrefetchedMedia | null> {
+  try {
+    const asset = db.getMedia().find(m => m.id === nextMediaId);
+    if (!asset) return null;
+
+    // Check if already analyzed to avoid redundant downloads
+    if (asset.aiAnalyzed && asset.aiAnalysisVersion === AI_ANALYSIS_VERSION && asset.aiStatus === 'ANALYZED') {
+      return null;
+    }
+
+    const downloadStart = Date.now();
+    let buffer: Buffer | null = null;
+    if (asset.url.startsWith('/api/media/proxy/')) {
+      const key = asset.url.replace('/api/media/proxy/', '');
+      if (PublicMediaStorage.isConfigured()) {
+        const { body } = await PublicMediaStorage.read(key);
+        const chunks: Buffer[] = [];
+        for await (const chunk of body) {
+          chunks.push(Buffer.from(chunk));
+        }
+        buffer = Buffer.concat(chunks);
+      }
+    }
+    const downloadTimeMs = Date.now() - downloadStart;
+
+    if (!buffer) return null;
+
+    const prepStart = Date.now();
+    const prepTimeMs = Date.now() - prepStart;
+
+    console.log(`[AI_Pipeline] Prefetched media ${nextMediaId} successfully: download=${downloadTimeMs}ms.`);
+    return {
+      mediaId: nextMediaId,
+      buffer,
+      downloadTimeMs,
+      prepTimeMs
+    };
+  } catch (err) {
+    console.warn(`[AI_Pipeline] Error prefetching next media ${nextMediaId}:`, err);
+    return null;
+  }
+}
 
 /**
  * Main worker loop that processes pending AI Media Jobs with Cooperative Cancellation & Performance Metrics.
@@ -16,16 +74,33 @@ export async function startAIWorker() {
 
   console.log('[AI_Media_Worker] Background worker started.');
 
+  // Normalize interrupted/stuck jobs on startup
+  try {
+    const activeJob = db.getActiveAIJob();
+    if (activeJob && (activeJob.status === 'RUNNING' || activeJob.status === 'RATE_LIMITED')) {
+      console.log(`[AI_Media_Worker] Resuming interrupted job ${activeJob.id} on startup.`);
+      db.updateAIJob(activeJob.id, {
+        status: 'RUNNING',
+        rateLimitWaitUntil: undefined
+      });
+    }
+  } catch (err) {
+    console.error('[AI_Media_Worker] Failed to normalize active job on startup:', err);
+  }
+
   try {
     while (true) {
       const activeJob = db.getActiveAIJob();
       console.log(`[AI_Media_Worker] STATUS_CHECK activeJobId=${activeJob?.id || 'none'} status=${activeJob?.status || 'none'}`);
+      
       if (!activeJob) {
+        clearPrefetchCache();
         await new Promise(resolve => setTimeout(resolve, 5000));
         continue;
       }
 
       if (activeJob.status === 'PAUSED' || activeJob.status === 'CANCELLED') {
+        clearPrefetchCache();
         await new Promise(resolve => setTimeout(resolve, 5000));
         continue;
       }
@@ -59,10 +134,12 @@ async function processJob(jobId: string) {
       status: jobBefore.failedItems > 0 ? 'COMPLETED_WITH_ERRORS' : 'COMPLETED',
       finishedAt: new Date().toISOString()
     });
+    clearPrefetchCache();
     return;
   }
 
   const mediaId = pendingIds[0];
+  const nextMediaId = pendingIds[1];
   const asset = db.getMedia().find(m => m.id === mediaId);
 
   // Cooperative cancellation check #1
@@ -97,13 +174,15 @@ async function processJob(jobId: string) {
 
   const queueWaitMs = Date.now() - queueStartTimestamp;
 
-  // Rate Limiting & Wait measurement
+  // Adaptive Rate Limiting wait with Admin UI UX feedback
   const rateLimitStart = Date.now();
-  const timeSinceLastCall = rateLimitStart - lastCallTime;
+  const minDelay = aiRateLimiter.getMinDelayMs() * aiRateLimiter.getAdaptiveMultiplier();
+  const lastStart = (aiRateLimiter as any).lastCallStartTime || 0;
+  const elapsed = rateLimitStart - lastStart;
   let rateLimitWaitMs = 0;
 
-  if (timeSinceLastCall < AI_MEDIA_MIN_DELAY_MS) {
-    rateLimitWaitMs = AI_MEDIA_MIN_DELAY_MS - timeSinceLastCall;
+  if (lastStart > 0 && elapsed < minDelay) {
+    rateLimitWaitMs = minDelay - elapsed;
     
     db.updateAIJob(jobId, { 
       status: 'RATE_LIMITED',
@@ -121,37 +200,69 @@ async function processJob(jobId: string) {
     db.updateAIJob(jobId, { status: 'RUNNING', rateLimitWaitUntil: undefined });
   }
 
-  lastCallTime = Date.now();
+  // Set last call start time to NOW since we are initiating the request flow
+  aiRateLimiter.setLastCallStartTime(Date.now());
 
   const itemStartTime = Date.now();
 
   try {
     db.updateMedia(mediaId, { aiStatus: 'PROCESSING' }, { name: 'AI_WORKER', email: 'ai-worker@admir.org' } as User);
 
-    // 1. Download / Retrieval Time
-    const downloadStart = Date.now();
+    // 1. Download / Retrieval using Efficient Pipeline
     let buffer: Buffer | null = null;
-    if (asset.url.startsWith('/api/media/proxy/')) {
-      const key = asset.url.replace('/api/media/proxy/', '');
-      if (PublicMediaStorage.isConfigured()) {
-        const { body } = await PublicMediaStorage.read(key);
-        const chunks: Buffer[] = [];
-        for await (const chunk of body) {
-          chunks.push(Buffer.from(chunk));
+    let downloadTimeMs = 0;
+    let prepTimeMs = 0;
+
+    // Check prefetch HIT
+    if (prefetchedItem && prefetchedItem.mediaId === mediaId) {
+      buffer = prefetchedItem.buffer;
+      downloadTimeMs = prefetchedItem.downloadTimeMs;
+      prepTimeMs = prefetchedItem.prepTimeMs;
+      console.log(`[AI_Pipeline] Cache HIT for media ${mediaId}! Saved download wait.`);
+      prefetchedItem = null; // consume
+    } else {
+      if (prefetchPromise) {
+        const res = await prefetchPromise;
+        if (res && res.mediaId === mediaId) {
+          buffer = res.buffer;
+          downloadTimeMs = res.downloadTimeMs;
+          prepTimeMs = res.prepTimeMs;
+          console.log(`[AI_Pipeline] Promise HIT for media ${mediaId}! Saved download wait.`);
         }
-        buffer = Buffer.concat(chunks);
+        prefetchPromise = null;
       }
     }
-    const downloadTimeMs = Date.now() - downloadStart;
+
+    // Direct download fallback if prefetch missed or wasn't triggered
+    if (!buffer) {
+      const downloadStart = Date.now();
+      if (asset.url.startsWith('/api/media/proxy/')) {
+        const key = asset.url.replace('/api/media/proxy/', '');
+        if (PublicMediaStorage.isConfigured()) {
+          const { body } = await PublicMediaStorage.read(key);
+          const chunks: Buffer[] = [];
+          for await (const chunk of body) {
+            chunks.push(Buffer.from(chunk));
+          }
+          buffer = Buffer.concat(chunks);
+        }
+      }
+      downloadTimeMs = Date.now() - downloadStart;
+    }
+
+    // Trigger prefetch for the NEXT item asynchronously in the background
+    if (nextMediaId) {
+      prefetchPromise = prefetchNextMedia(nextMediaId);
+    }
 
     if (!buffer) {
       throw new Error('Falha ao recuperar arquivo para análise.');
     }
 
-    // 2. Image Preparation Time (base64 conversion)
+    // 2. Image Preparation (base64 conversion)
     const prepStart = Date.now();
     const base64Data = buffer.toString('base64');
-    const prepTimeMs = Date.now() - prepStart;
+    prepTimeMs = Date.now() - prepStart;
 
     // Cooperative cancellation check #3 before calling Gemini
     const preGeminiJob = db.getAIJob(jobId);
@@ -222,7 +333,7 @@ async function processJob(jobId: string) {
     if (isQuotaOrRateLimit) {
       db.updateAIJob(jobId, { 
         status: 'PAUSED',
-        lastError: 'Cota da API Gemini esgotada (Rate Limit / Free Tier 20 req/dia atingido). Processamento pausado automaticamente.',
+        lastError: 'Cota da API Gemini esgotada (Rate Limit / Free Tier atingido). Processamento pausado automaticamente para evitar estouros de cota adicionais.',
         rateLimitWaitUntil: new Date(Date.now() + 3600000).toISOString()
       });
       return;

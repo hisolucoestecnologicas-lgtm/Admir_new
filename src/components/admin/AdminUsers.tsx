@@ -19,6 +19,7 @@ import { useToast } from '../../context/ToastContext';
 import { api } from '../../lib/api';
 import { User, AdminInvite, GranularPermissions, UserRole, PERMISSION_GROUPS, PermissionKey } from '../../types';
 import { getPresetPermissions, ALL_PERMISSIONS_KEYS } from '../../data/permissionPresets';
+import { PrivacyNotice } from '../common/PrivacyNotice';
 
 export function AdminUsers() {
   const { user, isOwner, hasPermission } = useAuth();
@@ -227,6 +228,8 @@ export function AdminUsers() {
         </p>
       </div>
 
+      <PrivacyNotice context="admin_users" theme="light" variant="compact" />
+
       {/* Users Table */}
       <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
         <div className="overflow-x-auto">
@@ -383,6 +386,8 @@ export function AdminUsers() {
                 <X className="w-5 h-5" />
               </button>
             </div>
+
+            <PrivacyNotice context="admin_users" theme="light" variant="compact" />
 
             {generatedInvite ? (
               <div className="space-y-4 bg-amber-50/50 p-6 rounded-2xl border border-amber-200">
@@ -548,6 +553,8 @@ export function AdminUsers() {
                 <X className="w-5 h-5" />
               </button>
             </div>
+
+            <PrivacyNotice context="admin_users" theme="light" variant="compact" />
 
             <div className="space-y-4">
               <div>

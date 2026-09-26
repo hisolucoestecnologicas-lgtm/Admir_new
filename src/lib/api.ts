@@ -34,6 +34,7 @@ import {
   MediaUsageLocation,
   MediaAIJob,
   MediaAIJobStatus,
+  CountryDocumentRule,
 } from '../types';
 
 class ApiClient {
@@ -314,6 +315,43 @@ class ApiClient {
     });
   }
 
+  public async validateAmbassadorDocument(
+    id: string,
+    docId: string,
+    isReanalysis = false
+  ): Promise<{ validation: any; ambassador: Ambassador }> {
+    return this.request<{ validation: any; ambassador: Ambassador }>(
+      `/api/ambassadors/${id}/documents/${docId}/validate`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ isReanalysis }),
+      }
+    );
+  }
+
+  public async applyDocumentFieldValue(
+    id: string,
+    docId: string,
+    fieldName: string
+  ): Promise<Ambassador> {
+    return this.request<Ambassador>(`/api/ambassadors/${id}/documents/${docId}/apply-field`, {
+      method: 'POST',
+      body: JSON.stringify({ fieldName }),
+    });
+  }
+
+  public async reviewDocumentFieldDivergence(
+    id: string,
+    docId: string,
+    fieldName: string,
+    notes?: string
+  ): Promise<Ambassador> {
+    return this.request<Ambassador>(`/api/ambassadors/${id}/documents/${docId}/review-field`, {
+      method: 'POST',
+      body: JSON.stringify({ fieldName, notes }),
+    });
+  }
+
   public async generateBioAI(payload: {
     name?: string;
     profession?: string;
@@ -347,11 +385,63 @@ class ApiClient {
 
   public async uploadOnboardingDocument(
     token: string,
-    docData: { type: string; fileName: string; fileData: string; mimeType: string; fileSize: number }
+    docData: {
+      type: string;
+      fileName: string;
+      fileData: string;
+      mimeType: string;
+      fileSize: number;
+      ruleId?: string;
+      documentCode?: string;
+    }
   ): Promise<PrivateDocument> {
     return this.request<PrivateDocument>(`/api/ambassador-onboarding/${token}/upload`, {
       method: 'POST',
       body: JSON.stringify(docData),
+    });
+  }
+
+  // --- COUNTRY DOCUMENT RULES (INTERNATIONAL CONFIGURATION) ---
+  public async getCountryDocumentRules(countryIso?: string, includeInactive = false): Promise<CountryDocumentRule[]> {
+    const params = new URLSearchParams();
+    if (countryIso) params.set('countryIso', countryIso);
+    if (includeInactive) params.set('includeInactive', 'true');
+    const query = params.toString() ? `?${params.toString()}` : '';
+    return this.request<CountryDocumentRule[]>(`/api/country-document-rules${query}`);
+  }
+
+  public async getApplicableDocumentRules(country?: string): Promise<CountryDocumentRule[]> {
+    const query = country ? `?country=${encodeURIComponent(country)}` : '';
+    return this.request<CountryDocumentRule[]>(`/api/country-document-rules/applicable${query}`);
+  }
+
+  public async createCountryDocumentRule(data: Partial<CountryDocumentRule>): Promise<CountryDocumentRule> {
+    return this.request<CountryDocumentRule>('/api/country-document-rules', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  public async updateCountryDocumentRule(
+    id: string,
+    data: Partial<CountryDocumentRule>
+  ): Promise<CountryDocumentRule> {
+    return this.request<CountryDocumentRule>(`/api/country-document-rules/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
+  }
+
+  public async deleteCountryDocumentRule(id: string): Promise<{ success: boolean }> {
+    return this.request<{ success: boolean }>(`/api/country-document-rules/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  public async reorderCountryDocumentRules(orderedIds: string[]): Promise<CountryDocumentRule[]> {
+    return this.request<CountryDocumentRule[]>('/api/country-document-rules/reorder', {
+      method: 'POST',
+      body: JSON.stringify({ orderedIds }),
     });
   }
 
@@ -628,8 +718,8 @@ class ApiClient {
   public async consolidateMedia(
     masterMediaId: string,
     targetMediaIds: string[]
-  ): Promise<{ success: boolean; masterMedia: MediaAsset; updatedReferencesCount: number; message: string }> {
-    return this.request<{ success: boolean; masterMedia: MediaAsset; updatedReferencesCount: number; message: string }>('/api/media/consolidate', {
+  ): Promise<{ success: boolean; masterMedia: MediaAsset; updatedReferencesCount: number; message: string; warnings?: string[] }> {
+    return this.request<{ success: boolean; masterMedia: MediaAsset; updatedReferencesCount: number; message: string; warnings?: string[] }>('/api/media/consolidate', {
       method: 'POST',
       body: JSON.stringify({ masterMediaId, targetMediaIds }),
     });

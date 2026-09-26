@@ -1128,24 +1128,29 @@ export function AdminMediaLibrary() {
         .filter(([id, act]) => act === 'consolidate' && id !== masterMediaId)
         .map(([id]) => id);
 
+      let consolidateMsg = '';
       if (targetsToConsolidate.length > 0) {
-        await api.consolidateMedia(masterMediaId, targetsToConsolidate);
+        const cRes = await api.consolidateMedia(masterMediaId, targetsToConsolidate);
+        consolidateMsg = cRes.message;
+        if (cRes.warnings && cRes.warnings.length > 0) {
+          cRes.warnings.forEach((w) => success('Informação de Consolidação', w));
+        }
       }
 
-      // 4. Resolve remaining actions (keep, trash, delete)
-      const actionsList = Object.entries(duplicateActions).map(([mediaId, action]) => {
-        let finalAction = action;
-        if (action === 'consolidate') {
-          finalAction = 'trash'; // Move consolidated file to trash now that its references are replaced!
-        }
-        return {
+      // 4. Resolve remaining explicit actions (keep, trash, delete) for non-consolidated items
+      const actionsList = Object.entries(duplicateActions)
+        .filter(([id, action]) => action !== 'consolidate')
+        .map(([mediaId, action]) => ({
           mediaId,
-          action: finalAction as 'keep' | 'trash' | 'delete',
-        };
-      });
+          action: action as 'keep' | 'trash' | 'delete',
+        }));
 
-      const res = await api.resolveDuplicates(selectedGroup.id, actionsList);
-      success('Consolidação & Resolução Concluídas!', res.message);
+      if (actionsList.length > 0) {
+        const res = await api.resolveDuplicates(selectedGroup.id, actionsList);
+        success('Resolução Concluída!', res.message);
+      } else if (consolidateMsg) {
+        success('Consolidação Concluída!', consolidateMsg);
+      }
       setSelectedGroup(null);
       fetchMedia();
     } catch (err: any) {

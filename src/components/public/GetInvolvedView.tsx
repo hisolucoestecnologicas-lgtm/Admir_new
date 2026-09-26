@@ -11,6 +11,7 @@ import { useSite } from '../../context/SiteContext';
 import { useToast } from '../../context/ToastContext';
 import { useTranslation } from '../../i18n/useTranslation';
 import { api } from '../../lib/api';
+import { PrivacyNotice } from '../common/PrivacyNotice';
 
 export function GetInvolvedView() {
   const { selectedParam, openDonationModal, language } = useSite();
@@ -281,6 +282,8 @@ export function GetInvolvedView() {
                 className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-xl focus:ring-2 focus:ring-amber-500 focus:outline-none"
               />
             </div>
+
+            <PrivacyNotice context="contact" theme="light" variant="compact" />
 
             <button
               type="submit"

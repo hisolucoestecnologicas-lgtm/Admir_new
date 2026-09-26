@@ -15,6 +15,7 @@ import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
 import { api } from '../../lib/api';
 import { Donation } from '../../types';
+import { PrivacyNotice } from '../common/PrivacyNotice';
 
 export function AdminDonations() {
   const { hasPermission } = useAuth();
@@ -145,6 +146,8 @@ export function AdminDonations() {
           </button>
         )}
       </div>
+
+      <PrivacyNotice context="donations" theme="light" variant="compact" />
 
       {/* KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -353,6 +356,8 @@ export function AdminDonations() {
                 </div>
               )}
             </div>
+
+            <PrivacyNotice context="donations" theme="light" variant="compact" />
 
             <div className="space-y-2">
               <button

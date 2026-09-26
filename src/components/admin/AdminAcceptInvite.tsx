@@ -4,6 +4,7 @@ import { api } from '../../lib/api';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
 import { useSite } from '../../context/SiteContext';
+import { PrivacyNotice } from '../common/PrivacyNotice';
 
 export function AdminAcceptInvite() {
   const { selectedParam, navigateTo } = useSite();
@@ -118,6 +119,8 @@ export function AdminAcceptInvite() {
             Você foi convidado(a) como <strong className="text-amber-400 uppercase">{inviteData.role}</strong> para o e-mail <strong>{inviteData.email}</strong>.
           </p>
         </div>
+
+        <PrivacyNotice context="admin_users" theme="dark" variant="compact" />
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>

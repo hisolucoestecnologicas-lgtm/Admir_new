@@ -2,10 +2,12 @@ import express, { Request, Response, NextFunction } from 'express';
 import Stripe from 'stripe';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { GoogleGenAI } from '@google/genai';
 import { db, RequestMetadata } from './db';
 import { PublicMediaStorage } from './storage';
 import { PrivateDocumentStorage } from './privateStorage';
+import { auditProductionGate } from './productionGate';
 import { GranularPermissions, User } from '../types';
 import { defaultAIProvider } from './aiProvider';
 import { analyzeImageWithGemini, clusterMediaAssetsWithGemini } from './aiMediaService';
@@ -17,6 +19,10 @@ import {
   getPrivateDocumentFromFirestore,
   deletePrivateDocumentFromFirestore,
 } from './firebaseStore';
+import {
+  extractDataFromDocumentWithAI,
+  compareAmbassadorWithExtractedData,
+} from './documentValidator';
 
 import { withAIRetry, getSharedGenAI, GEMINI_MODEL, AI_ANALYSIS_VERSION } from './aiUtils';
 
@@ -178,10 +184,14 @@ apiRouter.get('/ambassador-onboarding/:token', (req, res) => {
     return res.status(404).json({ error: 'Link de onboarding inválido, expirado ou revogado pela administração.' });
   }
 
+  const applicableRules = db.getApplicableRulesForCountry(candidate.country);
+
   // Return token-scoped candidate data safely (without other candidate/admin data)
   res.json({
     id: candidate.id,
     fullName: candidate.fullName,
+    country: candidate.country || '',
+    role: candidate.role || '',
     passportNumber: candidate.passportNumber || '',
     cpf: candidate.cpf || '',
     rgDni: candidate.rgDni || '',
@@ -198,9 +208,12 @@ apiRouter.get('/ambassador-onboarding/:token', (req, res) => {
     onboardingStatus: candidate.onboardingStatus,
     completionPercentage: candidate.completionPercentage,
     pendingItems: candidate.pendingItems,
+    applicableRules,
     documents: (candidate.documents || []).map((d) => ({
       id: d.id,
       type: d.type,
+      ruleId: d.ruleId,
+      documentCode: d.documentCode,
       fileName: d.fileName,
       originalName: d.originalName,
       fileSize: d.fileSize,
@@ -213,7 +226,7 @@ apiRouter.get('/ambassador-onboarding/:token', (req, res) => {
 apiRouter.put('/ambassador-onboarding/:token', (req, res) => {
   try {
     const { submitForAnalysis, ...updates } = req.body;
-    const updated = db.updateAmbassadorByToken(req.params.token, updates, Boolean(submitForAnalysis));
+    const updated = db.updateAmbassadorByToken(req.params.token, updates, Boolean(submitForAnalysis), getReqMeta(req));
     res.json(updated);
   } catch (err: any) {
     res.status(400).json({ error: err.message || 'Falha ao atualizar cadastro via token de onboarding' });
@@ -227,7 +240,7 @@ apiRouter.post('/ambassador-onboarding/:token/upload', async (req, res) => {
       return res.status(404).json({ error: 'Link de onboarding inválido ou expirado.' });
     }
 
-    const { type, fileName, fileData, mimeType, fileSize } = req.body;
+    const { type, fileName, fileData, mimeType, fileSize, ruleId, documentCode } = req.body;
     if (!fileData || !type) {
       return res.status(400).json({ error: 'Arquivo e tipo de documento são obrigatórios.' });
     }
@@ -246,6 +259,8 @@ apiRouter.post('/ambassador-onboarding/:token/upload', async (req, res) => {
 
     const newDoc = db.addPrivateDocumentToAmbassador(candidate.id, {
       type: type || 'other',
+      ruleId: ruleId || undefined,
+      documentCode: documentCode || type || undefined,
       fileName: safeName,
       originalName: fileName || 'documento',
       fileSize: fileSize || Buffer.byteLength(base64Data, 'base64'),
@@ -259,6 +274,27 @@ apiRouter.post('/ambassador-onboarding/:token/upload', async (req, res) => {
     } catch (fsErr: any) {
       console.warn(`[OnboardingUpload] Failed to save copy to Firestore:`, fsErr);
     }
+
+    // Record minimal safe audit log for candidate external upload
+    const userMeta: User = {
+      id: 'system-onboarding-candidate',
+      name: candidate.fullName || 'Candidato Externo',
+      email: candidate.email || 'candidato.externo@onboarding',
+      role: 'viewer',
+      permissions: {} as any,
+      status: 'active',
+      joinedAt: new Date().toISOString(),
+      lastLoginAt: new Date().toISOString(),
+    };
+
+    db.recordAuditLog(
+      userMeta,
+      'Upload',
+      'Ambassadors',
+      candidate.fullName || candidate.id,
+      `Documento privado do tipo "${type}" enviado via onboarding externo pelo candidato (Doc ID: ${newDoc.id})`,
+      getReqMeta(req)
+    );
 
     res.status(201).json(newDoc);
   } catch (err: any) {
@@ -847,11 +883,78 @@ apiRouter.post('/ambassadors/:id/revoke-link', requirePermission('ambassadors.ed
   }
 });
 
+// Country Document Rules (International Document Configuration)
+apiRouter.get('/country-document-rules', (req: AuthenticatedRequest, res) => {
+  try {
+    const { countryIso, includeInactive } = req.query;
+    const rules = db.getCountryDocumentRules(
+      countryIso as string,
+      includeInactive === 'true' || includeInactive === '1'
+    );
+    res.json(rules);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.get('/country-document-rules/applicable', (req: AuthenticatedRequest, res) => {
+  try {
+    const { country } = req.query;
+    const rules = db.getApplicableRulesForCountry(country as string);
+    res.json(rules);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/country-document-rules', requirePermission('ambassadors.edit'), (req: AuthenticatedRequest, res) => {
+  try {
+    const newRule = db.createCountryDocumentRule(req.body, req.user!, getReqMeta(req));
+    res.status(201).json(newRule);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.put('/country-document-rules/:id', requirePermission('ambassadors.edit'), (req: AuthenticatedRequest, res) => {
+  try {
+    const updatedRule = db.updateCountryDocumentRule(req.params.id, req.body, req.user!, getReqMeta(req));
+    res.json(updatedRule);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.delete('/country-document-rules/:id', requirePermission('ambassadors.edit'), (req: AuthenticatedRequest, res) => {
+  try {
+    const success = db.deleteCountryDocumentRule(req.params.id, req.user!, getReqMeta(req));
+    if (!success) {
+      return res.status(404).json({ error: 'Regra documental não encontrada.' });
+    }
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/country-document-rules/reorder', requirePermission('ambassadors.edit'), (req: AuthenticatedRequest, res) => {
+  try {
+    const { orderedIds } = req.body;
+    if (!Array.isArray(orderedIds)) {
+      return res.status(400).json({ error: 'orderedIds array required' });
+    }
+    const updated = db.reorderCountryDocumentRules(orderedIds, req.user!, getReqMeta(req));
+    res.json(updated);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // Private Document Upload & Management (Admin)
 apiRouter.post('/ambassadors/:id/documents', requirePermission('ambassadors.edit'), async (req: AuthenticatedRequest, res) => {
   try {
     const ambassadorId = req.params.id;
-    const { type, fileName, fileData, mimeType, fileSize } = req.body;
+    const { type, fileName, fileData, mimeType, fileSize, ruleId, documentCode } = req.body;
 
     if (!fileData || !type) {
       return res.status(400).json({ error: 'Arquivo e tipo de documento são obrigatórios.' });
@@ -893,6 +996,8 @@ apiRouter.post('/ambassadors/:id/documents', requirePermission('ambassadors.edit
 
     const newDoc = db.addPrivateDocumentToAmbassador(ambassadorId, {
       type: type || 'other',
+      ruleId: ruleId || undefined,
+      documentCode: documentCode || type || undefined,
       fileName: storageProvider === 'R2_PRIVATE' ? safeName : path.basename(finalPath),
       originalName: fileName || 'documento',
       fileSize: fileSize || buffer.length,
@@ -977,30 +1082,46 @@ apiRouter.delete('/ambassadors/:id/documents/:docId', requirePermission('ambassa
 // Secure Private Document Download Route (Enforces Admin Auth OR Matching Candidate Token)
 apiRouter.get('/ambassadors/:id/documents/:docId/download', async (req: AuthenticatedRequest, res) => {
   const { id: ambId, docId } = req.params;
-  const tokenQuery = req.query.token as string;
+  const tokenQuery =
+    (req.query.token as string) ||
+    (req.headers['x-onboarding-token'] as string) ||
+    (req.headers['x-token'] as string);
 
   const amb = db.getAmbassadorById(ambId);
   if (!amb) return res.status(404).json({ error: 'Embaixador não encontrado' });
 
-  // Security Check: Must be authenticated admin WITH ambassadors.view permission OR valid onboarding token
+  // STRICT SECURITY CHECK: Must possess valid authentication headers (Admin with permission) OR valid matching onboarding token
   let isAuthorized = false;
 
-  // Check admin session
+  // 1. Verify user authentication headers (Admin session/bearer token)
   resolveUser(req, res, () => {});
   if (req.user && (req.user.permissions?.['ambassadors.view'] || req.user.role === 'owner')) {
     isAuthorized = true;
-  } else if (tokenQuery && amb.onboardingToken === tokenQuery && amb.tokenStatus === 'active') {
-    isAuthorized = true;
   }
 
+  // 2. Verify candidate onboarding token if admin session is absent
+  if (!isAuthorized && tokenQuery) {
+    const matchesToken = amb.onboardingToken === tokenQuery;
+    const isActive = amb.tokenStatus === 'active';
+    const notExpired = !amb.tokenExpiresAt || new Date(amb.tokenExpiresAt).getTime() >= Date.now();
+    const notRevoked = !amb.tokenRevokedAt && !amb.onboardingTokenRevokedAt;
+
+    if (matchesToken && isActive && notExpired && notRevoked) {
+      isAuthorized = true;
+    }
+  }
+
+  // EXPLICIT 403 FORBIDDEN RESPONSE IF BOTH AUTHENTICATION HEADERS AND VALID ONBOARDING TOKEN ARE ABSENT OR INVALID
   if (!isAuthorized) {
-    return res.status(403).json({ error: 'Acesso negado. Documento diplomático privado reservado.' });
+    return res.status(403).json({
+      error: 'Acesso negado. A visualização de documentos diplomáticos privados no R2 exige autenticação administrativa válida ou token de onboarding ativo.',
+    });
   }
 
   const doc = (amb.documents || []).find((d) => d.id === docId);
   if (!doc) return res.status(404).json({ error: 'Documento não encontrado' });
 
-  // 1. Try R2 Private Storage if applicable
+  // 1. Try R2 Private Storage if applicable (protected by the strict check above)
   if (doc.storageProvider === 'R2_PRIVATE' && doc.path) {
     try {
       const { body, contentType, contentLength } = await PrivateDocumentStorage.read(doc.path);
@@ -1038,6 +1159,127 @@ apiRouter.get('/ambassadors/:id/documents/:docId/download', async (req: Authenti
   }
 
   return res.status(404).json({ error: 'Arquivo não localizado em nenhum dos armazenamentos seguros' });
+});
+
+// AI-Assisted Private Document Validation Route (Admin)
+apiRouter.post('/ambassadors/:id/documents/:docId/validate', requirePermission('ambassadors.edit'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id: ambId, docId } = req.params;
+    const { isReanalysis } = req.body;
+
+    const amb = db.getAmbassadorById(ambId);
+    if (!amb) return res.status(404).json({ error: 'Embaixador não encontrado' });
+
+    const doc = (amb.documents || []).find((d) => d.id === docId);
+    if (!doc) return res.status(404).json({ error: 'Documento não encontrado' });
+
+    // Retrieve file buffer safely server-side
+    let docBuffer: Buffer | null = null;
+
+    if (doc.storageProvider === 'R2_PRIVATE' && doc.path) {
+      try {
+        const { body } = await PrivateDocumentStorage.read(doc.path);
+        const chunks: Buffer[] = [];
+        for await (const chunk of body) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        docBuffer = Buffer.concat(chunks);
+      } catch (err: any) {
+        console.warn(`[DocValidation] R2 read failed:`, err.message);
+      }
+    }
+
+    if (!docBuffer) {
+      try {
+        const base64Data = await getPrivateDocumentFromFirestore(docId);
+        if (base64Data) {
+          docBuffer = Buffer.from(base64Data.replace(/^data:[^;]+;base64,/, ''), 'base64');
+        }
+      } catch (err) {
+        // ignore
+      }
+    }
+
+    if (!docBuffer) {
+      const filePath = doc.path && doc.path.startsWith('/') ? doc.path : path.join(process.cwd(), 'data', 'private_documents', ambId, doc.fileName);
+      if (fs.existsSync(filePath)) {
+        docBuffer = fs.readFileSync(filePath);
+      }
+    }
+
+    if (!docBuffer || docBuffer.length === 0) {
+      const errorValidation = compareAmbassadorWithExtractedData(
+        amb,
+        docId,
+        doc.type,
+        doc.originalName || doc.fileName,
+        null,
+        'Arquivo do documento não localizado no armazenamento seguro.'
+      );
+      const updatedAmb = db.saveDocumentValidation(ambId, errorValidation, req.user!, Boolean(isReanalysis), getReqMeta(req));
+      return res.json({ validation: errorValidation, ambassador: updatedAmb });
+    }
+
+    let extractedData = null;
+    let errorMsg: string | undefined;
+
+    try {
+      extractedData = await extractDataFromDocumentWithAI(docBuffer, doc.mimeType || 'image/jpeg');
+    } catch (aiErr: any) {
+      console.error(`[DocValidation] AI extraction error:`, aiErr.message);
+      errorMsg = `Falha na extração por IA: ${aiErr.message || 'Serviço indisponível'}`;
+    }
+
+    const validationRecord = compareAmbassadorWithExtractedData(
+      amb,
+      docId,
+      doc.type,
+      doc.originalName || doc.fileName,
+      extractedData,
+      errorMsg
+    );
+
+    const updatedAmbassador = db.saveDocumentValidation(
+      ambId,
+      validationRecord,
+      req.user!,
+      Boolean(isReanalysis),
+      getReqMeta(req)
+    );
+
+    res.json({
+      validation: validationRecord,
+      ambassador: updatedAmbassador,
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || 'Erro ao processar validação documental' });
+  }
+});
+
+apiRouter.post('/ambassadors/:id/documents/:docId/apply-field', requirePermission('ambassadors.edit'), (req: AuthenticatedRequest, res) => {
+  try {
+    const { id: ambId, docId } = req.params;
+    const { fieldName } = req.body;
+    if (!fieldName) return res.status(400).json({ error: 'Nome do campo é obrigatório' });
+
+    const updated = db.applyDocumentFieldValueToAmbassador(ambId, docId, fieldName, req.user!, getReqMeta(req));
+    res.json(updated);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/ambassadors/:id/documents/:docId/review-field', requirePermission('ambassadors.edit'), (req: AuthenticatedRequest, res) => {
+  try {
+    const { id: ambId, docId } = req.params;
+    const { fieldName, notes } = req.body;
+    if (!fieldName) return res.status(400).json({ error: 'Nome do campo é obrigatório' });
+
+    const updated = db.markDivergenceReviewed(ambId, docId, fieldName, notes, req.user!, getReqMeta(req));
+    res.json(updated);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // AI Biography Generator Route (Server-side @google/genai with strict anti-hallucination prompt)
@@ -1183,6 +1425,24 @@ apiRouter.post('/media/upload-file', requirePermission('media.upload'), async (r
       return res.status(400).json({ error: 'Arquivo e nome do arquivo são obrigatórios.' });
     }
 
+    const cleanBase64 = fileData.replace(/^data:[^;]+;base64,/, '');
+    const buffer = Buffer.from(cleanBase64, 'base64');
+    const finalMimeType = mimeType || 'image/jpeg';
+
+    // 1. Calculate content hash (SHA-256) for reliable content-based deduplication
+    const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+
+    // 2. Check if identical content is already stored (Deduplication Gate)
+    const existing = db.findMediaBySha256(sha256);
+    if (existing && !existing.isDeleted) {
+      return res.status(200).json({
+        ...existing,
+        isDuplicate: true,
+        duplicateOfId: existing.id,
+        message: `Mídia com conteúdo idêntico (SHA-256) já existe no acervo. Registro reaproveitado com sucesso.`,
+      });
+    }
+
     if (!PublicMediaStorage.isConfigured()) {
       return res.status(503).json({ error: 'Cloudflare R2 não está configurado para armazenamento persistente.' });
     }
@@ -1190,14 +1450,11 @@ apiRouter.post('/media/upload-file', requirePermission('media.upload'), async (r
     // Determine safe file name and object key
     const safeName = `${Date.now()}-${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
     const objectKey = `public/media/${safeName}`;
-    const cleanBase64 = fileData.replace(/^data:[^;]+;base64,/, '');
-    const buffer = Buffer.from(cleanBase64, 'base64');
-    const finalMimeType = mimeType || 'image/jpeg';
 
-    // 1. Upload to Cloudflare R2
+    // 3. Upload to Cloudflare R2
     const storageResult = await PublicMediaStorage.upload(objectKey, buffer, finalMimeType);
 
-    // 2. Register in database with the proxy URL
+    // 4. Register in database with the proxy URL and content hash
     const asset = db.addMedia(
       {
         filename: safeName,
@@ -1208,6 +1465,7 @@ apiRouter.post('/media/upload-file', requirePermission('media.upload'), async (r
         altText: title || 'Uploaded Public Media',
         caption: '',
         tags: Array.isArray(tags) ? tags : [],
+        sha256,
       },
       req.user!,
       getReqMeta(req)
@@ -1222,9 +1480,21 @@ apiRouter.post('/media/upload-file', requirePermission('media.upload'), async (r
 
 
 apiRouter.post('/media', requirePermission('media.upload'), (req: AuthenticatedRequest, res) => {
-  const { filename, originalName, url, mimeType, sizeBytes, altText, caption, tags } = req.body;
+  const { filename, originalName, url, mimeType, sizeBytes, altText, caption, tags, sha256 } = req.body;
   if (!url) {
     return res.status(400).json({ error: 'URL ou arquivo é obrigatório.' });
+  }
+
+  // Idempotence check by SHA-256 or exact URL
+  if (sha256) {
+    const existing = db.findMediaBySha256(sha256);
+    if (existing && !existing.isDeleted) {
+      return res.status(200).json(existing);
+    }
+  }
+  const existingByUrl = db.getMedia(false).find((m) => m.url === url);
+  if (existingByUrl) {
+    return res.status(200).json(existingByUrl);
   }
 
   // File size validation (limit 15MB)
@@ -1242,6 +1512,7 @@ apiRouter.post('/media', requirePermission('media.upload'), (req: AuthenticatedR
       altText: altText || '',
       caption: caption || '',
       tags: Array.isArray(tags) ? tags : [],
+      sha256,
     },
     req.user!,
     getReqMeta(req)
@@ -1331,17 +1602,16 @@ apiRouter.post('/media/upload-direct', requirePermission('media.bulk_upload'), e
 
     const buffer = req.body as Buffer;
 
-    // 1. Deduplication check via SHA-256
-    if (sha256) {
-      const existing = db.findMediaBySha256(sha256);
-      if (existing) {
-        return res.status(200).json({
-          isDuplicate: true,
-          duplicateOfId: existing.id,
-          asset: existing,
-          message: `Imagem duplicada detectada (Hash SHA-256 idêntico ao ativo ${existing.id}).`
-        });
-      }
+    // 1. Deduplication check via content SHA-256 hash
+    const computedSha256 = sha256 || crypto.createHash('sha256').update(buffer).digest('hex');
+    const existing = db.findMediaBySha256(computedSha256);
+    if (existing && !existing.isDeleted) {
+      return res.status(200).json({
+        isDuplicate: true,
+        duplicateOfId: existing.id,
+        asset: existing,
+        message: `Imagem duplicada detectada (Hash SHA-256 idêntico ao ativo ${existing.id}). Registro reaproveitado com sucesso.`
+      });
     }
 
     // 2. R2 Storage Upload
@@ -1366,7 +1636,7 @@ apiRouter.post('/media/upload-direct', requirePermission('media.bulk_upload'), e
         altText: title || 'Fotografia Institucional ADMIR',
         caption: '',
         tags: ['massa', 'importação'],
-        sha256,
+        sha256: computedSha256,
         albumId: albumId || undefined,
         aiAnalyzed: false,
       },
@@ -2894,4 +3164,19 @@ apiRouter.get('/sync/history', requirePermission('sync.view'), (req: Authenticat
     res.status(500).json({ error: err.message });
   }
 });
+
+/* =========================================================================
+   PRODUCTION GATE & DEPLOY AUDIT ENDPOINTS
+   ========================================================================= */
+
+// Production Gate Audit Endpoint (Non-destructive, provides verification checklist)
+apiRouter.get('/system/production-gate', (req: Request, res: Response) => {
+  try {
+    const audit = auditProductionGate();
+    res.json(audit);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Falha ao auditar Production Gate.' });
+  }
+});
+
 

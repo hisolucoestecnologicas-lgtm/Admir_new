@@ -33,7 +33,19 @@ import { useSite } from '../../context/SiteContext';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
 import { api } from '../../lib/api';
-import { Ambassador, AmbassadorOnboardingStatus, AmbassadorEditorialStatus, PrivateDocument, Language } from '../../types';
+import { Ambassador, AmbassadorOnboardingStatus, AmbassadorEditorialStatus, PrivateDocument, Language, CountryDocumentRule } from '../../types';
+import { PrivacyNotice } from '../common/PrivacyNotice';
+import { CountryDocumentRulesModal } from './CountryDocumentRulesModal';
+import {
+  maskCPF,
+  validateCPF,
+  formatPhone,
+  validateEmail,
+  validateBirthDate,
+  getExternalLinkStatus,
+  getExternalLinkBadgeColor,
+  getExternalLinkLabel,
+} from '../../utils/validation';
 
 export function AdminAmbassadors() {
   const { refreshAmbassadors } = useSite();
@@ -52,6 +64,9 @@ export function AdminAmbassadors() {
   const [search, setSearch] = useState('');
   const [onboardingFilter, setOnboardingFilter] = useState<string>('all');
   const [editorialFilter, setEditorialFilter] = useState<string>('all');
+  const [cardFilter, setCardFilter] = useState<'all' | 'onboarding' | 'published' | 'active_links'>('all');
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const ITEMS_PER_PAGE = 12;
 
   // Editor Modal State
   const [editingCandidate, setEditingCandidate] = useState<Ambassador | null>(null);
@@ -63,15 +78,32 @@ export function AdminAmbassadors() {
   // Generated Link State for Onboarding
   const [generatedLink, setGeneratedLink] = useState<{ url: string; token: string; expiresAt: string } | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [showRegenerateConfirm, setShowRegenerateConfirm] = useState(false);
+  const [generatingLink, setGeneratingLink] = useState(false);
 
   // AI Bio Assistant State
   const [generatingBio, setGeneratingBio] = useState(false);
   const [aiBioResult, setAiBioResult] = useState<{ bio_pt: string; bio_en: string; bio_es: string } | null>(null);
 
+  // Document Validation State
+  const [validatingDocId, setValidatingDocId] = useState<string | null>(null);
+  const [confirmApplyField, setConfirmApplyField] = useState<{
+    docId: string;
+    fieldName: 'fullName' | 'cpf' | 'rgDni' | 'passportNumber' | 'birthDate';
+    label: string;
+    value: string;
+  } | null>(null);
+  const [applyingField, setApplyingField] = useState(false);
+  const [reviewingField, setReviewingField] = useState<string | null>(null);
+
   // Private Document Upload State (in Admin modal)
   const [adminDocType, setAdminDocType] = useState<string>('passport');
   const [adminDocFile, setAdminDocFile] = useState<File | null>(null);
   const [uploadingAdminDoc, setUploadingAdminDoc] = useState(false);
+
+  // Country Document Rules State
+  const [showCountryRulesModal, setShowCountryRulesModal] = useState(false);
+  const [candidateRules, setCandidateRules] = useState<CountryDocumentRule[]>([]);
 
   // Form Field States
   // 1. Identification & Public Profile
@@ -169,6 +201,14 @@ export function AdminAmbassadors() {
   useEffect(() => {
     loadAdminAmbassadors();
   }, []);
+
+  useEffect(() => {
+    if (editingCandidate?.country) {
+      api.getApplicableDocumentRules(editingCandidate.country).then(setCandidateRules).catch(() => {});
+    } else {
+      api.getApplicableDocumentRules('DEFAULT').then(setCandidateRules).catch(() => {});
+    }
+  }, [editingCandidate?.country]);
 
   const openNewModal = () => {
     setIsNew(true);
@@ -275,6 +315,24 @@ export function AdminAmbassadors() {
       return;
     }
 
+    if (cpf.trim() && !validateCPF(cpf)) {
+      error('CPF Inválido', 'O CPF informado não atende aos dígitos verificadores ou possui sequência repetida.');
+      return;
+    }
+
+    if (email.trim() && !validateEmail(email)) {
+      error('E-mail Inválido', 'Informe um endereço de e-mail válido (ex: nome@dominio.com).');
+      return;
+    }
+
+    if (birthDate.trim()) {
+      const bd = validateBirthDate(birthDate);
+      if (!bd.valid) {
+        error('Data de Nascimento Inválida', bd.message || 'Verifique a data informada.');
+        return;
+      }
+    }
+
     const primaryRole = formPt.role.trim() || formEn.role.trim() || formEs.role.trim();
     const primaryCountry = formPt.country.trim() || formEn.country.trim() || formEs.country.trim();
 
@@ -327,17 +385,29 @@ export function AdminAmbassadors() {
 
     setSaving(true);
     try {
+      let savedAmbassador: Ambassador | null = null;
       if (isNew) {
-        await api.createAmbassador(payload);
-        success('Cadastro Criado!', `O registro de ${fullName} foi inserido no sistema.`);
-      } else if (editingCandidate) {
-        await api.updateAmbassador(editingCandidate.id, payload);
-        success('Cadastro Atualizado!', `Dados de ${fullName} foram armazenados.`);
+        savedAmbassador = await api.createAmbassador(payload);
+        success('Cadastro Criado!', `O registro de ${fullName} foi criado com sucesso. A ficha permanece aberta para preenchimento.`);
+        setIsNew(false);
+      } else if (editingCandidate?.id) {
+        savedAmbassador = await api.updateAmbassador(editingCandidate.id, payload);
+        success('Ficha Salva com Sucesso!', `Os dados de ${fullName} foram atualizados.`);
+      }
+
+      if (savedAmbassador) {
+        setEditingCandidate(savedAmbassador);
+        if (savedAmbassador.onboardingToken) {
+          setGeneratedLink({
+            token: savedAmbassador.onboardingToken,
+            url: `${window.location.origin}/#ambassador-onboarding?token=${savedAmbassador.onboardingToken}`,
+            expiresAt: savedAmbassador.tokenExpiresAt || '',
+          });
+        }
       }
 
       await loadAdminAmbassadors();
       await refreshAmbassadors();
-      setEditingCandidate(null);
     } catch (err: any) {
       error('Erro ao Salvar', err.message || 'Falha ao salvar registro.');
     } finally {
@@ -378,16 +448,31 @@ export function AdminAmbassadors() {
     }
   };
 
-  const handleGenerateLink = async () => {
+  const handleGenerateLink = async (isRegenerate = false) => {
     if (!editingCandidate?.id) return;
+    setGeneratingLink(true);
     try {
       const res = await api.generateOnboardingLink(editingCandidate.id);
-      setGeneratedLink(res);
-      setOnboardingStatus('link_enviado');
-      success('Link Gerado com Sucesso!', 'O link seguro de onboarding foi criado e ativado.');
+      const absoluteUrl = `${window.location.origin}/#ambassador-onboarding?token=${res.token}`;
+      const linkData = {
+        token: res.token,
+        url: absoluteUrl,
+        expiresAt: res.expiresAt,
+      };
+      setGeneratedLink(linkData);
+      setEditingCandidate((prev) => (prev ? { ...prev, onboardingToken: res.token, tokenStatus: 'active', tokenExpiresAt: res.expiresAt } : prev));
+      setShowRegenerateConfirm(false);
+      success(
+        isRegenerate ? 'Link Regenerado com Sucesso!' : 'Link Gerado com Sucesso!',
+        isRegenerate
+          ? 'Um novo token foi gerado e o anterior foi invalidado.'
+          : 'O link seguro de onboarding foi criado e ativado.'
+      );
       await loadAdminAmbassadors();
     } catch (err: any) {
-      error('Erro ao Gerar Link', err.message);
+      error(isRegenerate ? 'Erro ao Regenerar Link' : 'Erro ao Gerar Link', err.message);
+    } finally {
+      setGeneratingLink(false);
     }
   };
 
@@ -396,6 +481,8 @@ export function AdminAmbassadors() {
     try {
       await api.revokeOnboardingLink(editingCandidate.id);
       setGeneratedLink(null);
+      setEditingCandidate((prev) => (prev ? { ...prev, tokenStatus: 'revoked' } : prev));
+      setShowRegenerateConfirm(false);
       success('Link Revogado!', 'O acesso via token externo foi cancelado.');
       await loadAdminAmbassadors();
     } catch (err: any) {
@@ -498,7 +585,79 @@ export function AdminAmbassadors() {
     }
   };
 
-  // Filter Logic
+  const handleValidateDocument = async (doc: PrivateDocument) => {
+    if (!editingCandidate?.id) return;
+    setValidatingDocId(doc.id);
+    try {
+      const existingVal = (editingCandidate.documentValidations || []).find((v) => v.documentId === doc.id);
+      const res = await api.validateAmbassadorDocument(editingCandidate.id, doc.id, Boolean(existingVal));
+      setEditingCandidate(res.ambassador);
+      success(
+        'Validação Concluída!',
+        `Análise do documento "${doc.originalName || doc.fileName}" realizada pela IA com sucesso.`
+      );
+      await loadAdminAmbassadors();
+    } catch (err: any) {
+      error('Erro na Validação', err.message || 'Falha ao processar análise do documento.');
+    } finally {
+      setValidatingDocId(null);
+    }
+  };
+
+  const handleApplyField = async (
+    docId: string,
+    fieldName: 'fullName' | 'cpf' | 'rgDni' | 'passportNumber' | 'birthDate'
+  ) => {
+    if (!editingCandidate?.id) return;
+    setApplyingField(true);
+    try {
+      const updated = await api.applyDocumentFieldValue(editingCandidate.id, docId, fieldName);
+      setEditingCandidate(updated);
+
+      // Update form state if matching field
+      if (fieldName === 'fullName') setFullName(updated.fullName || '');
+      if (fieldName === 'cpf') setCpf(updated.cpf || '');
+      if (fieldName === 'rgDni') setRgDni(updated.rgDni || '');
+      if (fieldName === 'passportNumber') setPassportNumber(updated.passportNumber || '');
+      if (fieldName === 'birthDate') setBirthDate(updated.birthDate || '');
+
+      setConfirmApplyField(null);
+      success('Campo Atualizado!', `O valor cadastrado foi substituído com base no documento.`);
+      await loadAdminAmbassadors();
+    } catch (err: any) {
+      error('Erro ao Atualizar', err.message || 'Falha ao aplicar valor do documento.');
+    } finally {
+      setApplyingField(false);
+    }
+  };
+
+  const handleReviewField = async (docId: string, fieldName: string) => {
+    if (!editingCandidate?.id) return;
+    setReviewingField(`${docId}-${fieldName}`);
+    try {
+      const updated = await api.reviewDocumentFieldDivergence(editingCandidate.id, docId, fieldName);
+      setEditingCandidate(updated);
+      success('Divergência Revisada', 'O apontamento foi marcado como verificado pelo administrador.');
+      await loadAdminAmbassadors();
+    } catch (err: any) {
+      error('Erro ao Revisar', err.message);
+    } finally {
+      setReviewingField(null);
+    }
+  };
+
+  // Helpers for 4 Status Dimensions in Overview Cards
+  const ONBOARDING_STATUSES = ['novo', 'link_enviado', 'em_preenchimento', 'analisando', 'pendencia', 'aprovado', 'rejeitado'];
+  const isCandidateInOnboarding = (c: Ambassador) => ONBOARDING_STATUSES.includes(c.onboardingStatus || 'novo');
+  const isCandidatePublished = (c: Ambassador) => c.editorialStatus === 'published' || c.isVisible === true;
+  const isCandidateActiveLink = (c: Ambassador) => getExternalLinkStatus(c) === 'active';
+
+  const handleCardClick = (type: 'all' | 'onboarding' | 'published' | 'active_links') => {
+    setCardFilter((prev) => (prev === type ? 'all' : type));
+    setCurrentPage(1);
+  };
+
+  // Filter Logic (Search + Dropdown Filters + Clickable Card Filters Intersection)
   const filteredCandidates = candidates.filter((c) => {
     const searchLower = search.toLowerCase();
     const nameMatch = (c.fullName || c.name || '').toLowerCase().includes(searchLower);
@@ -514,8 +673,24 @@ export function AdminAmbassadors() {
     const matchesEditorial =
       editorialFilter === 'all' || (c.editorialStatus || 'draft') === editorialFilter;
 
-    return matchesSearch && matchesOnboarding && matchesEditorial;
+    let matchesCard = true;
+    if (cardFilter === 'onboarding') {
+      matchesCard = isCandidateInOnboarding(c);
+    } else if (cardFilter === 'published') {
+      matchesCard = isCandidatePublished(c);
+    } else if (cardFilter === 'active_links') {
+      matchesCard = isCandidateActiveLink(c);
+    }
+
+    return matchesSearch && matchesOnboarding && matchesEditorial && matchesCard;
   });
+
+  // Paginated List
+  const totalPages = Math.ceil(filteredCandidates.length / ITEMS_PER_PAGE) || 1;
+  const paginatedCandidates = filteredCandidates.slice(
+    (currentPage - 1) * ITEMS_PER_PAGE,
+    currentPage * ITEMS_PER_PAGE
+  );
 
   const getBadgeColorOnboarding = (status?: AmbassadorOnboardingStatus) => {
     switch (status) {
@@ -568,45 +743,118 @@ export function AdminAmbassadors() {
           </p>
         </div>
 
-        {canCreate && (
-          <button
-            type="button"
-            onClick={openNewModal}
-            className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-4 py-2.5 rounded-xl text-xs flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer"
-          >
-            <Plus className="w-4 h-4" />
-            <span>Registrar Novo Embaixador</span>
-          </button>
-        )}
+        <div className="flex items-center gap-2.5">
+          {hasPermission('ambassadors.edit') && (
+            <button
+              type="button"
+              onClick={() => setShowCountryRulesModal(true)}
+              className="bg-white hover:bg-slate-100 text-slate-800 border border-slate-300 font-bold px-4 py-2.5 rounded-xl text-xs flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer"
+            >
+              <Globe2 className="w-4 h-4 text-amber-600" />
+              <span>Regras Documentais por País</span>
+            </button>
+          )}
+
+          {canCreate && (
+            <button
+              type="button"
+              onClick={openNewModal}
+              className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-4 py-2.5 rounded-xl text-xs flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer"
+            >
+              <Plus className="w-4 h-4" />
+              <span>Registrar Novo Embaixador</span>
+            </button>
+          )}
+        </div>
       </div>
 
-      {/* Overview Cards */}
+      {/* Overview Cards (Filtros Clicáveis Acessíveis) */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-1 shadow-sm">
-          <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Total de Cadastros</p>
+        {/* Card 1: Total de Cadastros */}
+        <button
+          type="button"
+          onClick={() => handleCardClick('all')}
+          aria-pressed={cardFilter === 'all'}
+          className={`text-left bg-white border rounded-2xl p-4 space-y-1 shadow-sm transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-slate-400 hover:shadow-md ${
+            cardFilter === 'all'
+              ? 'border-slate-800 ring-2 ring-slate-800/20 bg-slate-50/80'
+              : 'border-slate-200 hover:border-slate-300'
+          }`}
+        >
+          <div className="flex items-center justify-between">
+            <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Total de Cadastros</p>
+            {cardFilter === 'all' && (
+              <span className="text-[9px] font-bold bg-slate-200 text-slate-800 px-2 py-0.5 rounded-full">Filtrando</span>
+            )}
+          </div>
           <p className="text-2xl font-bold text-slate-900">{candidates.length}</p>
-        </div>
+        </button>
 
-        <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-1 shadow-sm">
-          <p className="text-[11px] font-semibold text-amber-600 uppercase tracking-wider">Em Onboarding / Análise</p>
+        {/* Card 2: Em Onboarding */}
+        <button
+          type="button"
+          onClick={() => handleCardClick('onboarding')}
+          aria-pressed={cardFilter === 'onboarding'}
+          className={`text-left bg-white border rounded-2xl p-4 space-y-1 shadow-sm transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-amber-500 hover:shadow-md ${
+            cardFilter === 'onboarding'
+              ? 'border-amber-500 ring-2 ring-amber-500/20 bg-amber-50/50'
+              : 'border-slate-200 hover:border-amber-300'
+          }`}
+        >
+          <div className="flex items-center justify-between">
+            <p className="text-[11px] font-semibold text-amber-600 uppercase tracking-wider">Em Onboarding / Análise</p>
+            {cardFilter === 'onboarding' && (
+              <span className="text-[9px] font-bold bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full">Filtrando</span>
+            )}
+          </div>
           <p className="text-2xl font-bold text-amber-600">
-            {candidates.filter((c) => (c.onboardingStatus || 'novo') !== 'publicado').length}
+            {candidates.filter(isCandidateInOnboarding).length}
           </p>
-        </div>
+        </button>
 
-        <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-1 shadow-sm">
-          <p className="text-[11px] font-semibold text-emerald-600 uppercase tracking-wider">Publicados no Site</p>
+        {/* Card 3: Publicados no Site */}
+        <button
+          type="button"
+          onClick={() => handleCardClick('published')}
+          aria-pressed={cardFilter === 'published'}
+          className={`text-left bg-white border rounded-2xl p-4 space-y-1 shadow-sm transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-emerald-500 hover:shadow-md ${
+            cardFilter === 'published'
+              ? 'border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-50/50'
+              : 'border-slate-200 hover:border-emerald-300'
+          }`}
+        >
+          <div className="flex items-center justify-between">
+            <p className="text-[11px] font-semibold text-emerald-600 uppercase tracking-wider">Publicados no Site</p>
+            {cardFilter === 'published' && (
+              <span className="text-[9px] font-bold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full">Filtrando</span>
+            )}
+          </div>
           <p className="text-2xl font-bold text-emerald-600">
-            {candidates.filter((c) => c.editorialStatus === 'published').length}
+            {candidates.filter(isCandidatePublished).length}
           </p>
-        </div>
+        </button>
 
-        <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-1 shadow-sm">
-          <p className="text-[11px] font-semibold text-purple-600 uppercase tracking-wider">Links Externos Ativos</p>
+        {/* Card 4: Links Externos Ativos */}
+        <button
+          type="button"
+          onClick={() => handleCardClick('active_links')}
+          aria-pressed={cardFilter === 'active_links'}
+          className={`text-left bg-white border rounded-2xl p-4 space-y-1 shadow-sm transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-purple-500 hover:shadow-md ${
+            cardFilter === 'active_links'
+              ? 'border-purple-500 ring-2 ring-purple-500/20 bg-purple-50/50'
+              : 'border-slate-200 hover:border-purple-300'
+          }`}
+        >
+          <div className="flex items-center justify-between">
+            <p className="text-[11px] font-semibold text-purple-600 uppercase tracking-wider">Links Externos Ativos</p>
+            {cardFilter === 'active_links' && (
+              <span className="text-[9px] font-bold bg-purple-100 text-purple-800 px-2 py-0.5 rounded-full">Filtrando</span>
+            )}
+          </div>
           <p className="text-2xl font-bold text-purple-600">
-            {candidates.filter((c) => c.tokenStatus === 'active').length}
+            {candidates.filter(isCandidateActiveLink).length}
           </p>
-        </div>
+        </button>
       </div>
 
       {/* Filter Toolbar */}
@@ -617,7 +865,10 @@ export function AdminAmbassadors() {
             type="text"
             placeholder="Buscar por nome, país, e-mail ou cargo..."
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setCurrentPage(1);
+            }}
             className="w-full pl-9 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-900 placeholder-slate-400 focus:outline-none focus:border-amber-500 focus:bg-white transition-all"
           />
         </div>
@@ -626,7 +877,10 @@ export function AdminAmbassadors() {
           {/* Onboarding Status Filter */}
           <select
             value={onboardingFilter}
-            onChange={(e) => setOnboardingFilter(e.target.value)}
+            onChange={(e) => {
+              setOnboardingFilter(e.target.value);
+              setCurrentPage(1);
+            }}
             className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-700 font-medium focus:outline-none focus:border-amber-500"
           >
             <option value="all">Status Onboarding: Todos</option>
@@ -641,7 +895,10 @@ export function AdminAmbassadors() {
           {/* Editorial Status Filter */}
           <select
             value={editorialFilter}
-            onChange={(e) => setEditorialFilter(e.target.value)}
+            onChange={(e) => {
+              setEditorialFilter(e.target.value);
+              setCurrentPage(1);
+            }}
             className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-700 font-medium focus:outline-none focus:border-amber-500"
           >
             <option value="all">Visibilidade Editorial: Todos</option>
@@ -661,8 +918,9 @@ export function AdminAmbassadors() {
           <p className="text-slate-400">Tente ajustar os filtros de busca ou crie um novo cadastro.</p>
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filteredCandidates.map((cand) => {
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {paginatedCandidates.map((cand) => {
             const displayName = cand.fullName || cand.name || 'Candidato sem identificação';
             const pct = cand.completionPercentage || 0;
             const pendingCount = (cand.pendingItems || []).length;
@@ -673,10 +931,10 @@ export function AdminAmbassadors() {
                 className="bg-white border border-slate-200 hover:border-amber-300 rounded-2xl p-5 space-y-4 shadow-sm transition-all flex flex-col justify-between"
               >
                 <div className="space-y-3">
-                  {/* Top Badges */}
-                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                  {/* Top Badges (3 Dimensões: Onboarding, Publicação, Link Externo) */}
+                  <div className="flex items-center justify-between gap-1.5 flex-wrap">
                     <span
-                      className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold border ${getBadgeColorOnboarding(
+                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold border ${getBadgeColorOnboarding(
                         cand.onboardingStatus
                       )}`}
                     >
@@ -684,13 +942,21 @@ export function AdminAmbassadors() {
                     </span>
 
                     <span
-                      className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold border ${
+                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold border ${
                         cand.editorialStatus === 'published'
                           ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                           : 'bg-slate-100 text-slate-600 border-slate-200'
                       }`}
                     >
                       {cand.editorialStatus === 'published' ? 'Publicado' : 'Rascunho'}
+                    </span>
+
+                    <span
+                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold border ${getExternalLinkBadgeColor(
+                        getExternalLinkStatus(cand)
+                      )}`}
+                    >
+                      {getExternalLinkLabel(getExternalLinkStatus(cand))}
                     </span>
                   </div>
 
@@ -777,6 +1043,35 @@ export function AdminAmbassadors() {
               </div>
             );
           })}
+          </div>
+
+          {/* Pagination Controls */}
+          {totalPages > 1 && (
+            <div className="bg-white border border-slate-200 rounded-2xl p-4 flex items-center justify-between text-xs text-slate-600 shadow-sm">
+              <span>
+                Mostrando <strong>{(currentPage - 1) * ITEMS_PER_PAGE + 1}</strong> a <strong>{Math.min(currentPage * ITEMS_PER_PAGE, filteredCandidates.length)}</strong> de <strong>{filteredCandidates.length}</strong> registros
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={currentPage === 1}
+                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                  className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-lg disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
+                >
+                  Anterior
+                </button>
+                <span className="font-bold text-slate-800">Página {currentPage} de {totalPages}</span>
+                <button
+                  type="button"
+                  disabled={currentPage === totalPages}
+                  onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                  className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-lg disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
+                >
+                  Próxima
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -1164,24 +1459,18 @@ export function AdminAmbassadors() {
               {/* TAB 2: Private Personal Data */}
               {activeTab === 'private' && (
                 <div className="space-y-6">
-                  <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 flex items-start gap-3 text-amber-800 text-xs">
-                    <Lock className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
-                    <div>
-                      <p className="font-bold">Armazenamento Restrito Diplomático</p>
-                      <p className="mt-0.5">
-                        Estes dados são estritamente confidenciais. Eles JAMAIS são expostos na API pública ou no website.
-                      </p>
-                    </div>
-                  </div>
+                  <PrivacyNotice context="ambassador_private_data" theme="light" variant="banner" />
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                     <div className="space-y-1">
-                      <label className="text-xs font-semibold text-slate-700">Passaporte Internacional</label>
+                      <label className="text-xs font-semibold text-slate-700">
+                        Passaporte Internacional <span className="text-slate-400 font-normal">(opcional)</span>
+                      </label>
                       <input
                         type="text"
                         value={passportNumber}
                         onChange={(e) => setPassportNumber(e.target.value)}
-                        placeholder="Número do passaporte"
+                        placeholder="Número do passaporte (opcional)"
                         className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-xs font-mono text-slate-900 focus:bg-white focus:outline-none"
                       />
                     </div>
@@ -1191,7 +1480,7 @@ export function AdminAmbassadors() {
                       <input
                         type="text"
                         value={cpf}
-                        onChange={(e) => setCpf(e.target.value)}
+                        onChange={(e) => setCpf(maskCPF(e.target.value))}
                         placeholder="000.000.000-00"
                         className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-xs font-mono text-slate-900 focus:bg-white focus:outline-none"
                       />
@@ -1253,7 +1542,7 @@ export function AdminAmbassadors() {
                       <input
                         type="text"
                         value={phone}
-                        onChange={(e) => setPhone(e.target.value)}
+                        onChange={(e) => setPhone(formatPhone(e.target.value))}
                         placeholder="+55 (00) 00000-0000"
                         className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-xs text-slate-900 focus:bg-white focus:outline-none"
                       />
@@ -1320,6 +1609,80 @@ export function AdminAmbassadors() {
               {/* TAB 3: Private Documents */}
               {activeTab === 'docs' && (
                 <div className="space-y-6">
+                  <PrivacyNotice context="ambassador_docs" theme="light" variant="banner" />
+
+                  {/* Checklist de Conformidade Documental por País */}
+                  {editingCandidate && (
+                    <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
+                      <div className="flex items-center justify-between border-b border-slate-200 pb-2">
+                        <div className="flex items-center gap-2">
+                          <Globe2 className="w-4 h-4 text-amber-600" />
+                          <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                            Requisitos Documentais da Missão — {editingCandidate.country || 'Padrão Internacional'}
+                          </h4>
+                        </div>
+                        <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-600">
+                          {candidateRules.length} {candidateRules.length === 1 ? 'requisito' : 'requisitos'}
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        {candidateRules.map((rule) => {
+                          const isFulfilled = (editingCandidate.documents || []).some(
+                            (d) =>
+                              d.ruleId === rule.id ||
+                              d.documentCode === rule.documentCode ||
+                              d.type === rule.documentCode ||
+                              (rule.documentCode === 'photo' && ((photo && photo.trim().length > 0) || d.type === 'photo')) ||
+                              (rule.documentCode === 'passport' && (d.type === 'passport' || d.type === 'rg'))
+                          );
+
+                          return (
+                            <div
+                              key={rule.id}
+                              className={`p-2.5 rounded-xl border flex items-center justify-between gap-2 text-xs transition-colors ${
+                                isFulfilled
+                                  ? 'bg-emerald-50/70 border-emerald-200 text-emerald-900'
+                                  : rule.isRequired
+                                  ? 'bg-amber-50/70 border-amber-200 text-amber-900'
+                                  : 'bg-white border-slate-200 text-slate-600'
+                              }`}
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                {isFulfilled ? (
+                                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                                ) : rule.isRequired ? (
+                                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                                ) : (
+                                  <Clock className="w-4 h-4 text-slate-400 shrink-0" />
+                                )}
+                                <div className="truncate">
+                                  <p className="font-semibold truncate">{rule.documentName}</p>
+                                  <p className="text-[10px] text-slate-500">
+                                    {rule.isRequired ? 'Obrigatório ADMIR' : 'Opcional'} • {rule.category}
+                                    {rule.sourceType && (
+                                      <span className="ml-1 text-[9px] font-mono px-1 py-0.2 rounded bg-slate-100 text-slate-600">
+                                        [{rule.sourceType}]
+                                      </span>
+                                    )}
+                                  </p>
+                                </div>
+                              </div>
+
+                              <button
+                                type="button"
+                                onClick={() => setAdminDocType(rule.documentCode)}
+                                className="shrink-0 text-[10px] font-bold px-2 py-1 rounded bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 transition-colors cursor-pointer"
+                              >
+                                Selecionar
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="bg-slate-900 text-white rounded-2xl p-5 space-y-4">
                     <h3 className="text-xs font-bold text-amber-400 uppercase tracking-wider flex items-center gap-2">
                       <Upload className="w-4 h-4" /> Anexar Documento Privado no Armazenamento Seguro
@@ -1338,13 +1701,26 @@ export function AdminAmbassadors() {
                             onChange={(e) => setAdminDocType(e.target.value)}
                             className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none"
                           >
-                            <option value="photo">Fotografia Privada</option>
-                            <option value="passport">Passaporte</option>
-                            <option value="cpf">CPF</option>
-                            <option value="rg">RG / DNI</option>
-                            <option value="blood_type">Comprovante Sanguíneo</option>
-                            <option value="curriculum">Currículo PDF/DOC</option>
-                            <option value="other">Outro Documento</option>
+                            {candidateRules.length > 0 ? (
+                              <>
+                                {candidateRules.map((r) => (
+                                  <option key={r.id} value={r.documentCode}>
+                                    {r.documentName} {r.isRequired ? '(*Obrigatório)' : '(Opcional)'}
+                                  </option>
+                                ))}
+                                <option value="other">Outro Documento Privado</option>
+                              </>
+                            ) : (
+                              <>
+                                <option value="photo">Fotografia Privada</option>
+                                <option value="passport">Passaporte</option>
+                                <option value="cpf">CPF</option>
+                                <option value="rg">RG / DNI</option>
+                                <option value="blood_type">Comprovante Sanguíneo</option>
+                                <option value="curriculum">Currículo PDF/DOC</option>
+                                <option value="other">Outro Documento</option>
+                              </>
+                            )}
                           </select>
                         </div>
 
@@ -1410,6 +1786,22 @@ export function AdminAmbassadors() {
                             </div>
 
                             <div className="flex items-center gap-2 shrink-0">
+                              <button
+                                type="button"
+                                disabled={validatingDocId === doc.id}
+                                onClick={() => handleValidateDocument(doc)}
+                                className="bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 text-xs font-bold px-3 py-1.5 rounded-xl transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                              >
+                                <Sparkles className={`w-3.5 h-3.5 text-amber-600 ${validatingDocId === doc.id ? 'animate-spin' : ''}`} />
+                                <span>
+                                  {validatingDocId === doc.id
+                                    ? 'Analisando...'
+                                    : (editingCandidate.documentValidations || []).some((v) => v.documentId === doc.id)
+                                    ? 'Reanalisar com IA'
+                                    : 'Analisar com IA'}
+                                </span>
+                              </button>
+
                               <a
                                 href={`/api/ambassadors/${editingCandidate.id}/documents/${doc.id}/download`}
                                 target="_blank"
@@ -1433,6 +1825,221 @@ export function AdminAmbassadors() {
                       </div>
                     )}
                   </div>
+
+                  {/* SECTION: AI-ASSISTED DOCUMENT VALIDATION */}
+                  {editingCandidate.documentValidations && editingCandidate.documentValidations.length > 0 && (
+                    <div className="space-y-4 pt-4 border-t border-slate-200">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2 font-serif-heading">
+                            <Shield className="w-4.5 h-4.5 text-amber-600" />
+                            Validação Documental Assistida por IA
+                          </h3>
+                          <p className="text-xs text-slate-500">
+                            Conferência estrita entre os dados digitados e os documentos privados anexados. A IA auxilia; a decisão final é humana.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Confirmation Banner for Field Substitution */}
+                      {confirmApplyField && (
+                        <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 space-y-3 animate-in fade-in duration-200">
+                          <div className="flex items-start gap-2.5">
+                            <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                            <div className="text-xs text-amber-900 space-y-1">
+                              <p className="font-bold">Confirmar substituição cadastral?</p>
+                              <p>
+                                Deseja substituir o valor do campo <strong>{confirmApplyField.label}</strong> cadastrado para o valor identificado no documento: <strong className="font-mono bg-amber-100 px-1.5 py-0.5 rounded">{confirmApplyField.value}</strong>?
+                              </p>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 pl-7">
+                            <button
+                              type="button"
+                              disabled={applyingField}
+                              onClick={() => handleApplyField(confirmApplyField.docId, confirmApplyField.fieldName)}
+                              className="bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-bold text-xs px-3.5 py-1.5 rounded-xl transition-colors cursor-pointer"
+                            >
+                              {applyingField ? 'Atualizando...' : 'Confirmar e Atualizar Cadastro'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmApplyField(null)}
+                              className="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold text-xs px-3.5 py-1.5 rounded-xl transition-colors cursor-pointer"
+                            >
+                              Cancelar
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Summary Cards */}
+                      {(() => {
+                        const allVals = editingCandidate.documentValidations || [];
+                        const totalMatching = allVals.reduce((acc, v) => acc + (v.summary?.matchingCount || 0), 0);
+                        const totalDivergence = allVals.reduce((acc, v) => acc + (v.summary?.divergenceCount || 0), 0);
+                        const totalUnverifiable = allVals.reduce((acc, v) => acc + (v.summary?.unverifiableCount || 0), 0);
+                        const totalNotPresent = allVals.reduce((acc, v) => acc + (v.summary?.notPresentCount || 0), 0);
+                        const totalNotApplicable = allVals.reduce((acc, v) => acc + (v.summary?.notApplicableCount || 0), 0);
+
+                        return (
+                          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
+                            <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 text-center">
+                              <p className="text-[10px] uppercase font-bold text-slate-400">Analisados</p>
+                              <p className="text-base font-bold text-slate-800">{allVals.length}</p>
+                            </div>
+                            <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-center">
+                              <p className="text-[10px] uppercase font-bold text-emerald-600">Conferem</p>
+                              <p className="text-base font-bold text-emerald-700">{totalMatching}</p>
+                            </div>
+                            <div className="bg-rose-50 border border-rose-200 rounded-xl p-3 text-center">
+                              <p className="text-[10px] uppercase font-bold text-rose-600">Divergências</p>
+                              <p className="text-base font-bold text-rose-700">{totalDivergence}</p>
+                            </div>
+                            <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 text-center">
+                              <p className="text-[10px] uppercase font-bold text-slate-500">Não Validado</p>
+                              <p className="text-base font-bold text-slate-700">{totalUnverifiable}</p>
+                            </div>
+                            <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 text-center">
+                              <p className="text-[10px] uppercase font-bold text-slate-500">Não Consta</p>
+                              <p className="text-base font-bold text-slate-700">{totalNotPresent}</p>
+                            </div>
+                            <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 text-center">
+                              <p className="text-[10px] uppercase font-bold text-slate-400">Não Aplicável</p>
+                              <p className="text-base font-bold text-slate-600">{totalNotApplicable}</p>
+                            </div>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Validation Cards per Document */}
+                      <div className="space-y-4">
+                        {editingCandidate.documentValidations.map((v) => (
+                          <div
+                            key={v.analysisId}
+                            className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3 shadow-sm"
+                          >
+                            <div className="flex items-center justify-between gap-3 border-b border-slate-100 pb-3 flex-wrap">
+                              <div className="flex items-center gap-2.5">
+                                <div className="w-8 h-8 rounded-lg bg-amber-50 text-amber-700 flex items-center justify-center font-bold text-xs shrink-0">
+                                  IA
+                                </div>
+                                <div>
+                                  <h4 className="text-xs font-bold text-slate-900">
+                                    {v.documentOriginalName} <span className="text-slate-400 font-normal">({v.documentType})</span>
+                                  </h4>
+                                  <p className="text-[10px] text-slate-500">
+                                    Analisado em {new Date(v.analyzedAt).toLocaleString()} • Modelo: <span className="font-mono text-slate-700">{v.model}</span>
+                                  </p>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-2">
+                                <span
+                                  className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                                    v.status === 'completed'
+                                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                      : v.status === 'unreadable'
+                                      ? 'bg-amber-50 text-amber-700 border-amber-200'
+                                      : 'bg-slate-100 text-slate-600 border-slate-200'
+                                  }`}
+                                >
+                                  {v.status === 'completed' ? 'Análise Concluída' : v.status === 'unreadable' ? 'Documento Ilegível' : 'Erro Técnico'}
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Comparison Table */}
+                            <div className="overflow-x-auto">
+                              <table className="w-full text-left text-xs">
+                                <thead>
+                                  <tr className="border-b border-slate-100 text-[11px] font-bold text-slate-400 uppercase">
+                                    <th className="py-2 px-3">Campo</th>
+                                    <th className="py-2 px-3">Valor Cadastrado</th>
+                                    <th className="py-2 px-3">Valor no Documento</th>
+                                    <th className="py-2 px-3">Resultado</th>
+                                    <th className="py-2 px-3 text-right">Ação Administrativa</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100">
+                                  {v.fields.map((f) => (
+                                    <tr key={f.fieldName} className="hover:bg-slate-50/80">
+                                      <td className="py-2.5 px-3 font-semibold text-slate-800">
+                                        {f.fieldLabel}
+                                      </td>
+                                      <td className="py-2.5 px-3 font-mono text-slate-700">
+                                        {f.fieldName === 'cpf' && f.registeredValue
+                                          ? f.registeredValue.replace(/^(\d{3})\.\d{3}\.\d{3}-(\d{2})$/, '$1.***.***-$2')
+                                          : f.registeredValue || <span className="text-slate-400 italic">Vazio</span>}
+                                      </td>
+                                      <td className="py-2.5 px-3 font-mono text-slate-900">
+                                        {f.extractedValue ? (
+                                          <span className="font-semibold">{f.extractedValue}</span>
+                                        ) : (
+                                          <span className="text-slate-400 italic">Não identificado</span>
+                                        )}
+                                      </td>
+                                      <td className="py-2.5 px-3">
+                                        <span
+                                          className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                                            f.result === 'CONFERE'
+                                              ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                              : f.result === 'DIVERGÊNCIA ENCONTRADA'
+                                              ? 'bg-rose-50 text-rose-700 border-rose-200'
+                                              : f.result === 'NÃO FOI POSSÍVEL VALIDAR'
+                                              ? 'bg-slate-100 text-slate-600 border-slate-300'
+                                              : f.result === 'NÃO APLICÁVEL'
+                                              ? 'bg-slate-100 text-slate-500 border-slate-200'
+                                              : 'bg-slate-100 text-slate-600 border-slate-200'
+                                          }`}
+                                        >
+                                          {f.result === 'CONFERE' && <Check className="w-3 h-3" />}
+                                          {f.result === 'DIVERGÊNCIA ENCONTRADA' && <AlertCircle className="w-3 h-3 text-rose-600" />}
+                                          {f.result}
+                                        </span>
+                                      </td>
+                                      <td className="py-2.5 px-3 text-right">
+                                        {f.result === 'DIVERGÊNCIA ENCONTRADA' && f.extractedValue ? (
+                                          <div className="flex items-center justify-end gap-1.5">
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                setConfirmApplyField({
+                                                  docId: v.documentId,
+                                                  fieldName: f.fieldName,
+                                                  label: f.fieldLabel,
+                                                  value: f.extractedValue,
+                                                })
+                                              }
+                                              className="bg-amber-600 hover:bg-amber-700 text-white font-bold text-[10px] px-2.5 py-1 rounded-lg transition-colors cursor-pointer"
+                                            >
+                                              Utilizar do Documento
+                                            </button>
+                                            <button
+                                              type="button"
+                                              disabled={reviewingField === `${v.documentId}-${f.fieldName}`}
+                                              onClick={() => handleReviewField(v.documentId, f.fieldName)}
+                                              className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[10px] px-2.5 py-1 rounded-lg transition-colors cursor-pointer"
+                                            >
+                                              Revisado
+                                            </button>
+                                          </div>
+                                        ) : f.notes ? (
+                                          <span className="text-[10px] text-slate-500 italic">{f.notes}</span>
+                                        ) : (
+                                          <span className="text-[10px] text-slate-400">—</span>
+                                        )}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1461,7 +2068,7 @@ export function AdminAmbassadors() {
                     </p>
 
                     {generatedLink ? (
-                      <div className="space-y-3 pt-2">
+                      <div className="space-y-4 pt-2">
                         <div className="flex items-center gap-2 bg-slate-950 p-3 rounded-xl border border-slate-800">
                           <input
                             type="text"
@@ -1484,23 +2091,63 @@ export function AdminAmbassadors() {
                           <span>Válido até: <strong className="text-slate-200">{new Date(generatedLink.expiresAt).toLocaleDateString()}</strong></span>
                         </div>
 
-                        <button
-                          type="button"
-                          onClick={handleRevokeLink}
-                          className="bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 font-bold text-xs px-4 py-2 rounded-xl transition-colors cursor-pointer"
-                        >
-                          Revogar Acesso do Link
-                        </button>
+                        {showRegenerateConfirm ? (
+                          <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 space-y-3">
+                            <div className="flex items-start gap-2">
+                              <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                              <p className="text-xs text-amber-200">
+                                <strong>Atenção:</strong> Ao regenerar o link, o token anterior será permanentemente invalidado e qualquer pessoa que utilize o link antigo perderá o acesso. Deseja continuar?
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                disabled={generatingLink}
+                                onClick={() => handleGenerateLink(true)}
+                                className="bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-bold text-xs px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
+                              >
+                                {generatingLink ? 'Regenerando...' : 'Confirmar e Invalidar Link Anterior'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setShowRegenerateConfirm(false)}
+                                className="bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
+                              >
+                                Cancelar
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-3 pt-1">
+                            <button
+                              type="button"
+                              disabled={generatingLink}
+                              onClick={() => setShowRegenerateConfirm(true)}
+                              className="bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs px-4 py-2 rounded-xl transition-colors cursor-pointer flex items-center gap-1.5"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5 text-amber-400" />
+                              <span>Regenerar Novo Link</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={handleRevokeLink}
+                              className="bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 font-bold text-xs px-4 py-2 rounded-xl transition-colors cursor-pointer"
+                            >
+                              Revogar Acesso do Link
+                            </button>
+                          </div>
+                        )}
                       </div>
                     ) : (
                       <button
                         type="button"
-                        disabled={isNew}
-                        onClick={handleGenerateLink}
+                        disabled={isNew || generatingLink}
+                        onClick={() => handleGenerateLink(false)}
                         className="bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-bold text-xs px-5 py-3 rounded-xl flex items-center gap-2 transition-colors cursor-pointer"
                       >
-                        <RefreshCw className="w-4 h-4" />
-                        <span>{isNew ? 'Salve o registro básico antes' : 'Gerar Link Seguro de Onboarding'}</span>
+                        <RefreshCw className={`w-4 h-4 ${generatingLink ? 'animate-spin' : ''}`} />
+                        <span>{isNew ? 'Salve o registro básico antes' : generatingLink ? 'Gerando Link...' : 'Gerar Link Seguro de Onboarding'}</span>
                       </button>
                     )}
                   </div>
@@ -1578,6 +2225,46 @@ export function AdminAmbassadors() {
               {/* TAB 6: Onboarding Status & Checklist */}
               {activeTab === 'status' && (
                 <div className="space-y-6">
+                  {/* Summary of the 4 Independent Status Dimensions */}
+                  <div className="bg-slate-50 border border-slate-200 rounded-2xl p-5 space-y-3">
+                    <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-2">
+                      <Shield className="w-4 h-4 text-amber-600" /> Resumo das 4 Dimensões de Status (Decopladas)
+                    </h4>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                      {/* Dimensão 1 */}
+                      <div className="bg-white p-3 rounded-xl border border-slate-200 space-y-1">
+                        <span className="text-[10px] font-bold text-slate-400 uppercase">1. Onboarding</span>
+                        <div className="font-bold text-slate-800">
+                          {getLabelOnboarding(onboardingStatus)}
+                        </div>
+                      </div>
+
+                      {/* Dimensão 2 */}
+                      <div className="bg-white p-3 rounded-xl border border-slate-200 space-y-1">
+                        <span className="text-[10px] font-bold text-slate-400 uppercase">2. Publicação</span>
+                        <div className={`font-bold ${editorialStatus === 'published' ? 'text-emerald-700' : 'text-slate-600'}`}>
+                          {editorialStatus === 'published' ? 'Publicado no Site' : 'Rascunho (Oculto)'}
+                        </div>
+                      </div>
+
+                      {/* Dimensão 3 */}
+                      <div className="bg-white p-3 rounded-xl border border-slate-200 space-y-1">
+                        <span className="text-[10px] font-bold text-slate-400 uppercase">3. Completude</span>
+                        <div className="font-bold text-amber-700">
+                          {editingCandidate.completionPercentage || 0}% Completo
+                        </div>
+                      </div>
+
+                      {/* Dimensão 4 */}
+                      <div className="bg-white p-3 rounded-xl border border-slate-200 space-y-1">
+                        <span className="text-[10px] font-bold text-slate-400 uppercase">4. Link Externo</span>
+                        <div className="font-bold text-purple-700">
+                          {getExternalLinkLabel(getExternalLinkStatus(editingCandidate))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-4">
                     <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wider">
                       Status de Progresso do Processo de Onboarding
@@ -1773,6 +2460,13 @@ export function AdminAmbassadors() {
           </div>
         </div>
       )}
+
+      {/* Country Document Rules Management Modal */}
+      <CountryDocumentRulesModal
+        isOpen={showCountryRulesModal}
+        onClose={() => setShowCountryRulesModal(false)}
+        onRulesChanged={loadAdminAmbassadors}
+      />
     </div>
   );
 }
