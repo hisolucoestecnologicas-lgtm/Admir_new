@@ -55,6 +55,7 @@ import {
   CountryDocumentRule,
 } from '../types';
 import { DEFAULT_NAMING_CONFIG, generateOrganizedName } from './namingService';
+import { saveAppStateToFirestore, loadAppStateFromFirestore } from './firebaseStore';
 import {
   INITIAL_SITE_SETTINGS,
   INITIAL_PROGRAMS,
@@ -153,22 +154,244 @@ export interface RequestMetadata {
   userAgent?: string;
 }
 
+export const DEPLOY_DATA_MODE = 'STRUCTURE_ONLY';
+export const DEV_DATA_SOURCE = 'dev_app_state (Workspace local / Firestore dev_app_state)';
+export const PROD_DATA_SOURCE = 'prod_app_state (Firestore Persistent Cloud Datastore: ai-studio-remixremixadmira-f0c0c025-03d6-4da1-8bec-59fc4e7728cb)';
+
+export const PRIMARY_DATA_SOURCE_DEV = DEV_DATA_SOURCE;
+export const PRIMARY_DATA_SOURCE_PROD = PROD_DATA_SOURCE;
+export const LOCAL_FILES_USED_AS_RUNTIME_DATABASE = false;
+export const LOCAL_FILES_USED_AS_FALLBACK = false;
+export const INITIAL_DATA_USED_AT_STARTUP = false;
+export const FIRESTORE_USED_AS_PRIMARY = true;
+
+export const ALLOW_LOCAL_DATA_FALLBACK = false;
+export const ALLOW_STARTUP_SEED = false;
+export const ALLOW_STARTUP_SYNC = false;
+export const ALLOW_STARTUP_IMPORT = false;
+
+export function resolveRuntimeEnvironment(context?: {
+  host?: string;
+  xForwardedHost?: string;
+  appEnv?: string;
+  kService?: string;
+}): 'production' | 'development' | 'unknown' {
+  const host = (context?.host || context?.xForwardedHost || '').trim().toLowerCase();
+  
+  const hasKServiceInContext = context && 'kService' in context;
+  const kService = ((hasKServiceInContext ? context.kService : process.env.K_SERVICE) || '').trim().toLowerCase();
+
+  const hasAppEnvInContext = context && 'appEnv' in context;
+  const appEnv = ((hasAppEnvInContext ? context.appEnv : process.env.APP_ENV) || '').trim().toLowerCase();
+
+  // 1. Determine Host-based signal
+  let hostEnv: 'production' | 'development' | 'unknown' | null = null;
+  if (host) {
+    if (host === 'admir-american-diplomatic-mission-of-5577.ai.studio') {
+      hostEnv = 'production';
+    } else if (
+      host === 'localhost' ||
+      host.startsWith('localhost:') ||
+      host === '127.0.0.1' ||
+      host.startsWith('127.0.0.1:') ||
+      host === '0.0.0.0' ||
+      host.startsWith('0.0.0.0:') ||
+      host.includes('ais-dev-') ||
+      host.includes('ais-pre-')
+    ) {
+      hostEnv = 'development';
+    } else if (host.endsWith('.run.app')) {
+      if (host.includes('ais-dev-') || host.includes('ais-pre-')) {
+        hostEnv = 'development';
+      } else {
+        // Generic run.app host is unknown
+        hostEnv = 'unknown';
+      }
+    } else {
+      hostEnv = 'unknown';
+    }
+  }
+
+  // 2. Determine Service/EnvVar-based signal
+  let serviceEnv: 'production' | 'development' | 'unknown' | null = null;
+  if (appEnv) {
+    if (appEnv === 'production') {
+      serviceEnv = 'production';
+    } else if (appEnv === 'development' || appEnv === 'preview' || appEnv === 'dev') {
+      serviceEnv = 'development';
+    } else {
+      serviceEnv = 'unknown';
+    }
+  } else if (kService) {
+    if (
+      kService.startsWith('ais-dev-') ||
+      kService.startsWith('ais-pre-') ||
+      kService.includes('preview') ||
+      kService.includes('dev-') ||
+      kService.includes('pre-')
+    ) {
+      serviceEnv = 'development';
+    } else if (
+      kService.includes('prod') ||
+      kService.includes('admir-american-diplomatic-mission-of-5577')
+    ) {
+      serviceEnv = 'production';
+    } else {
+      // Generic run.app service is unknown
+      serviceEnv = 'unknown';
+    }
+  } else {
+    // If no context parameters exist and we are running completely local with no host context
+    if (!host) {
+      serviceEnv = 'development';
+    }
+  }
+
+  // 3. Evaluate results and catch conflicts
+  if (hostEnv === 'unknown' || serviceEnv === 'unknown') {
+    return 'unknown';
+  }
+
+  if (hostEnv && serviceEnv && hostEnv !== serviceEnv) {
+    console.error(`[ENVIRONMENT_CONFLICT] Host signal (${hostEnv}) and Env variable signal (${serviceEnv}) conflict!`);
+    return 'unknown';
+  }
+
+  return hostEnv || serviceEnv || 'unknown';
+}
+
+export function isProductionEnvironment(): boolean {
+  return resolveRuntimeEnvironment() === 'production';
+}
+
+export function isTestEnvironment(): boolean {
+  return process.env.NODE_ENV === 'test' || Boolean(process.env.ADMIR_TEST_MODE);
+}
+
 const DB_DIR = path.resolve(process.cwd(), 'data');
 const DB_FILE = path.join(DB_DIR, 'admir_database.json');
 
 class DatabaseService {
   private data: DatabaseSchema;
+  private isInitialized = false;
+  public isProductionBlocked = false;
+  public productionBlockedReason = '';
 
   constructor() {
     (global as any).__startup_timers = (global as any).__startup_timers || {};
     (global as any).__startup_timers.dbInitStart = performance.now();
     this.data = this.loadDatabase();
     (global as any).__startup_timers.dbInitEnd = performance.now();
+
+    this.initPersistentStore().catch((err) => {
+      if (isProductionEnvironment()) {
+        console.error('[ADMIR_FAIL_CLOSED] Fatal: Production datastore initialization failed.', err?.message || err);
+      } else {
+        console.warn('[ADMIR_PERSISTENCE_GUARD] Background store init warning:', err?.message || err);
+      }
+    });
+  }
+
+  public async initPersistentStore(): Promise<void> {
+    if (this.isInitialized && !this.isProductionBlocked) return;
+
+    // 1. Resolve environment
+    const env = resolveRuntimeEnvironment();
+    console.log(`[ADMIR_STARTUP] 1. Resolved environment identity: "${env}"`);
+
+    // 2. Validate environment
+    if (env === 'unknown') {
+      this.isProductionBlocked = true;
+      this.productionBlockedReason = 'ENVIRONMENT_CONFLICT: Sinais de ambiente conflitantes ou indeterminados.';
+      console.error(`[ADMIR_FAIL_CLOSED] CRITICAL FAIL: Environment validation failed: ${this.productionBlockedReason}`);
+      throw new Error(`[ADMIR_FAIL_CLOSED] STARTUP BLOCKED: Environment conflict detected or unknown.`);
+    }
+
+    // 3. Select datasource
+    const dataSource = env === 'production' ? PROD_DATA_SOURCE : DEV_DATA_SOURCE;
+    console.log(`[ADMIR_STARTUP] 2. Selected Data Source: "${dataSource}"`);
+
+    // 4. Hydrate
+    console.log(`[ADMIR_PERSISTENCE_GUARD] Hydrating database from Firestore persistent cloud store ("${env === 'production' ? 'prod_app_state' : 'dev_app_state'}")...`);
+
+    try {
+      const remoteState = await loadAppStateFromFirestore(env as 'production' | 'development');
+      if (remoteState && Object.keys(remoteState).length > 0) {
+        console.log(`[ADMIR_PERSISTENCE_GUARD] SUCCESS: Hydrated persistent state from Firestore (${env}). Container local filesystem database ignored.`);
+        this.data = this.sanitizeAndHydrateSchema(remoteState);
+        this.isInitialized = true;
+        this.isProductionBlocked = false;
+        return;
+      }
+
+      if (env === 'production') {
+        throw new Error('Production datastore is empty. Empty database is strictly prohibited in Production.');
+      }
+
+      console.log(`[ADMIR_PERSISTENCE_GUARD] Firestore remote store "${env}" is empty or initial boot. Seeding initial baseline and persisting to Firestore...`);
+      await saveAppStateToFirestore(env as 'production' | 'development', this.data);
+      this.isInitialized = true;
+      this.isProductionBlocked = false;
+    } catch (err: any) {
+      if (env === 'production') {
+        this.isProductionBlocked = true;
+        this.productionBlockedReason = `Firestore prod_app_state store connection error: ${err?.message || err}`;
+        console.error(`[ADMIR_FAIL_CLOSED] CRITICAL FAIL: Production startup blocked. Firestore prod_app_state store unavailable (${err?.message || err}). Local/memory fallback is strictly prohibited in Production.`);
+        throw new Error(`[ADMIR_FAIL_CLOSED] STARTUP BLOCKED: Production requires active Firestore prod_app_state datastore. Local/memory fallback disabled.`);
+      } else {
+        console.warn(`[ADMIR_DEV_FALLBACK] Notice: Could not connect to Firestore dev_app_state store (${err?.message || err}). Falling back to local/memory datastore for DEV environment only.`);
+        this.isInitialized = true;
+      }
+    }
+  }
+
+  public sanitizeAndHydrateSchema(parsed: any): DatabaseSchema {
+    const schema: DatabaseSchema = {
+      settings: parsed.settings || { ...INITIAL_SITE_SETTINGS },
+      programs: Array.isArray(parsed.programs) ? parsed.programs : [...INITIAL_PROGRAMS],
+      stories: Array.isArray(parsed.stories) ? parsed.stories : [...INITIAL_STORIES],
+      ambassadors: Array.isArray(parsed.ambassadors) ? parsed.ambassadors : [...INITIAL_AMBASSADORS],
+      media: Array.isArray(parsed.media) ? parsed.media : [...INITIAL_MEDIA_ASSETS],
+      donations: Array.isArray(parsed.donations) ? parsed.donations : [...INITIAL_DONATIONS],
+      paymentEvents: Array.isArray(parsed.paymentEvents) ? parsed.paymentEvents : [],
+      tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [...INITIAL_TASKS],
+      taskTicketCounter: typeof parsed.taskTicketCounter === 'number' ? parsed.taskTicketCounter : undefined,
+      taskWorkspaces: Array.isArray(parsed.taskWorkspaces) ? parsed.taskWorkspaces : [],
+      taskWorkflows: Array.isArray(parsed.taskWorkflows) ? parsed.taskWorkflows : [],
+      taskWorkflowStages: Array.isArray(parsed.taskWorkflowStages) ? parsed.taskWorkflowStages : [],
+      taskDependencies: Array.isArray(parsed.taskDependencies) ? parsed.taskDependencies : [],
+      users: Array.isArray(parsed.users) ? parsed.users : [],
+      invites: Array.isArray(parsed.invites) ? parsed.invites : [...INITIAL_INVITES],
+      auditLogs: Array.isArray(parsed.auditLogs) ? parsed.auditLogs : [...INITIAL_AUDIT_LOGS],
+      newsletterSubscribers: Array.isArray(parsed.newsletterSubscribers) ? parsed.newsletterSubscribers : [],
+      contactMessages: Array.isArray(parsed.contactMessages) ? parsed.contactMessages : [],
+      assistantSettings: parsed.assistantSettings,
+      assistantFaqs: Array.isArray(parsed.assistantFaqs) ? parsed.assistantFaqs : [],
+      contactRequests: Array.isArray(parsed.contactRequests) ? parsed.contactRequests : [],
+      assistantFeedbacks: Array.isArray(parsed.assistantFeedbacks) ? parsed.assistantFeedbacks : [],
+      maintenanceSettings: parsed.maintenanceSettings || JSON.parse(JSON.stringify(INITIAL_MAINTENANCE_SETTINGS)),
+      albums: Array.isArray(parsed.albums) ? parsed.albums : [],
+      importJobs: Array.isArray(parsed.importJobs) ? parsed.importJobs : [],
+      duplicateGroups: Array.isArray(parsed.duplicateGroups) ? parsed.duplicateGroups : [],
+      namingConfig: parsed.namingConfig || null,
+      aiClusterProposals: Array.isArray(parsed.aiClusterProposals) ? parsed.aiClusterProposals : [],
+      aiJobs: Array.isArray(parsed.aiJobs) ? parsed.aiJobs : [],
+      countryDocumentRules: Array.isArray(parsed.countryDocumentRules) ? parsed.countryDocumentRules : JSON.parse(JSON.stringify(INITIAL_COUNTRY_DOCUMENT_RULES)),
+    };
+
+    const changedAccounts = this.reconcileOfficialAccounts(schema);
+    const changedTasks = this.migrateLegacyTasks(schema);
+
+    if (changedAccounts || changedTasks) {
+      this.save(schema);
+    }
+    return schema;
   }
 
   private loadDatabase(): DatabaseSchema {
     (global as any).__startup_timers = (global as any).__startup_timers || {};
     (global as any).__startup_timers.loadDatabaseStart = performance.now();
+    console.log(`[ADMIR_DEPLOY_GUARD] DEPLOY_DATA_MODE=${DEPLOY_DATA_MODE}: Publications carry structure-only. Dev mutations, mock data, and test seeds are strictly quarantined.`);
     try {
       if (!fs.existsSync(DB_DIR)) {
         fs.mkdirSync(DB_DIR, { recursive: true });
@@ -595,9 +818,23 @@ class DatabaseService {
       if (!fs.existsSync(DB_DIR)) {
         fs.mkdirSync(DB_DIR, { recursive: true });
       }
-      const tmpFile = `${DB_FILE}.tmp`;
+
+      // Safeguard: Test runs must write to isolated test file, never corrupting real dev database
+      const targetFile = isTestEnvironment()
+        ? path.join(DB_DIR, 'test_admir_database_isolated.json')
+        : DB_FILE;
+
+      const tmpFile = `${targetFile}.tmp`;
       fs.writeFileSync(tmpFile, JSON.stringify(toWrite, null, 2), 'utf-8');
-      fs.renameSync(tmpFile, DB_FILE);
+      fs.renameSync(tmpFile, targetFile);
+
+      // Async write to persistent external store in Firestore by environment
+      if (!isTestEnvironment()) {
+        const env = isProductionEnvironment() ? 'production' : 'development';
+        saveAppStateToFirestore(env, toWrite).catch((err) => {
+          console.error(`[FirebaseStore] Background persist error (${env}):`, err.message || err);
+        });
+      }
     } catch (e) {
       console.error('Failed to write database atomically:', e);
     }
@@ -2591,6 +2828,27 @@ class DatabaseService {
           const { newStr, changed } = replaceStr(amb.photo);
           if (changed) { amb.photo = newStr; updatedCount++; }
         }
+        if (amb.translations) {
+          for (const lang of ['pt', 'en', 'es'] as const) {
+            const tr = amb.translations[lang];
+            if (tr && tr.bio) {
+              const { newStr, changed } = replaceStr(tr.bio);
+              if (changed) { tr.bio = newStr; updatedCount++; }
+            }
+          }
+        }
+        if (Array.isArray(amb.documents)) {
+          for (const doc of amb.documents) {
+            if (doc.path) {
+              const { newStr, changed } = replaceStr(doc.path);
+              if (changed) { doc.path = newStr; updatedCount++; }
+            }
+            if (doc.storageKey && sourceAsset.storageKey && targetAsset.storageKey && doc.storageKey.includes(sourceAsset.storageKey)) {
+              doc.storageKey = doc.storageKey.replaceAll(sourceAsset.storageKey, targetAsset.storageKey);
+              updatedCount++;
+            }
+          }
+        }
       }
     }
 
@@ -2618,6 +2876,10 @@ class DatabaseService {
           const { newStr, changed } = replaceStr(prog.fullDescription);
           if (changed) { prog.fullDescription = newStr; updatedCount++; }
         }
+        if (prog.shortDescription) {
+          const { newStr, changed } = replaceStr(prog.shortDescription);
+          if (changed) { prog.shortDescription = newStr; updatedCount++; }
+        }
         if (prog.translations) {
           for (const lang of ['pt', 'en', 'es'] as const) {
             const tr = prog.translations[lang] as any;
@@ -2633,6 +2895,10 @@ class DatabaseService {
               if (tr.fullDescription) {
                 const { newStr, changed } = replaceStr(tr.fullDescription);
                 if (changed) { tr.fullDescription = newStr; updatedCount++; }
+              }
+              if (tr.shortDescription) {
+                const { newStr, changed } = replaceStr(tr.shortDescription);
+                if (changed) { tr.shortDescription = newStr; updatedCount++; }
               }
             }
           }
@@ -2655,6 +2921,18 @@ class DatabaseService {
           const { newStr, changed } = replaceStr(story.fullText);
           if (changed) { story.fullText = newStr; updatedCount++; }
         }
+        if (story.fullContent) {
+          const { newStr, changed } = replaceStr(story.fullContent);
+          if (changed) { story.fullContent = newStr; updatedCount++; }
+        }
+        if (story.shortSummary) {
+          const { newStr, changed } = replaceStr(story.shortSummary);
+          if (changed) { story.shortSummary = newStr; updatedCount++; }
+        }
+        if (story.excerpt) {
+          const { newStr, changed } = replaceStr(story.excerpt);
+          if (changed) { story.excerpt = newStr; updatedCount++; }
+        }
         if (Array.isArray(story.photoGallery) && story.photoGallery.length > 0) {
           let galChanged = false;
           story.photoGallery = story.photoGallery.map((gUrl) => {
@@ -2672,9 +2950,25 @@ class DatabaseService {
                 const { newStr, changed } = replaceStr(tr.featuredPhoto);
                 if (changed) { tr.featuredPhoto = newStr; updatedCount++; }
               }
+              if (tr.heroImage) {
+                const { newStr, changed } = replaceStr(tr.heroImage);
+                if (changed) { tr.heroImage = newStr; updatedCount++; }
+              }
               if (tr.fullText) {
                 const { newStr, changed } = replaceStr(tr.fullText);
                 if (changed) { tr.fullText = newStr; updatedCount++; }
+              }
+              if (tr.fullContent) {
+                const { newStr, changed } = replaceStr(tr.fullContent);
+                if (changed) { tr.fullContent = newStr; updatedCount++; }
+              }
+              if (tr.shortSummary) {
+                const { newStr, changed } = replaceStr(tr.shortSummary);
+                if (changed) { tr.shortSummary = newStr; updatedCount++; }
+              }
+              if (tr.excerpt) {
+                const { newStr, changed } = replaceStr(tr.excerpt);
+                if (changed) { tr.excerpt = newStr; updatedCount++; }
               }
             }
           }
@@ -2695,10 +2989,21 @@ class DatabaseService {
         }
       }
     }
+    if (sourceAsset.albumId) {
+      if (!targetAsset.albumId) {
+        targetAsset.albumId = sourceAsset.albumId;
+      }
+      sourceAsset.albumId = undefined;
+      updatedCount++;
+    }
 
     // 6. Tasks
     if (this.data.tasks) {
       for (const task of this.data.tasks) {
+        if (task.description) {
+          const { newStr, changed } = replaceStr(task.description);
+          if (changed) { task.description = newStr; updatedCount++; }
+        }
         if (Array.isArray(task.attachments)) {
           for (const att of task.attachments) {
             if (att.url) {
@@ -2710,6 +3015,32 @@ class DatabaseService {
               updatedCount++;
             }
           }
+        }
+        if (Array.isArray(task.comments)) {
+          for (const c of task.comments) {
+            if (c.content) {
+              const { newStr, changed } = replaceStr(c.content);
+              if (changed) { c.content = newStr; updatedCount++; }
+            }
+          }
+        }
+      }
+    }
+
+    // 7. Assistant FAQs
+    if (this.data.assistantFaqs) {
+      for (const faq of this.data.assistantFaqs) {
+        if (faq.answerPt) {
+          const { newStr, changed } = replaceStr(faq.answerPt);
+          if (changed) { faq.answerPt = newStr; updatedCount++; }
+        }
+        if (faq.answerEn) {
+          const { newStr, changed } = replaceStr(faq.answerEn);
+          if (changed) { faq.answerEn = newStr; updatedCount++; }
+        }
+        if (faq.answerEs) {
+          const { newStr, changed } = replaceStr(faq.answerEs);
+          if (changed) { faq.answerEs = newStr; updatedCount++; }
         }
       }
     }
@@ -2918,22 +3249,25 @@ class DatabaseService {
     mediaB: MediaAsset;
     mediaC: MediaAsset;
   } {
-    if (process.env.NODE_ENV === 'production' || process.env.APP_ENV === 'production') {
+    if (isProductionEnvironment()) {
       throw new Error('Acesso negado: Criação de cenários e dados de teste é estritamente proibida no ambiente de Produção.');
     }
 
     const now = new Date().toISOString();
     const sharedSha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
-    const sharedUrl = 'https://picsum.photos/id/1050/800/600';
+    const timestamp = Date.now();
+    const urlA = `https://cdn.admir.org/media/test_dup_a_${timestamp}.webp`;
+    const urlB = `https://cdn.admir.org/media/test_dup_b_${timestamp}.webp`;
+    const urlC = `https://cdn.admir.org/media/test_dup_c_${timestamp}.webp`;
 
     const mediaA: MediaAsset = {
-      id: `test_dup_a_${Date.now()}`,
-      filename: 'logo-admir-header.webp',
+      id: `test_dup_a_${timestamp}`,
+      filename: `logo-admir-header-${timestamp}.webp`,
       originalName: 'logo-admir-header.webp',
       organizedName: 'ADMIR_Logo_Header_001',
       title: 'Logotipo Header Oficial',
-      url: sharedUrl,
-      thumbUrl: sharedUrl,
+      url: urlA,
+      thumbUrl: urlA,
       mimeType: 'image/webp',
       sizeBytes: 45200,
       fileSize: '45.2 KB',
@@ -2947,13 +3281,13 @@ class DatabaseService {
     };
 
     const mediaB: MediaAsset = {
-      id: `test_dup_b_${Date.now()}`,
-      filename: 'brasao-admir-oficial.webp',
+      id: `test_dup_b_${timestamp}`,
+      filename: `brasao-admir-oficial-${timestamp}.webp`,
       originalName: 'brasao-admir-oficial.webp',
       organizedName: 'ADMIR_Brasao_Oficial_002',
       title: 'Brasão Diplomático ADMIR',
-      url: sharedUrl,
-      thumbUrl: sharedUrl,
+      url: urlB,
+      thumbUrl: urlB,
       mimeType: 'image/webp',
       sizeBytes: 45200,
       fileSize: '45.2 KB',
@@ -2967,13 +3301,13 @@ class DatabaseService {
     };
 
     const mediaC: MediaAsset = {
-      id: `test_dup_c_${Date.now()}`,
-      filename: 'logo-admir-copia-nao-utilizada.webp',
+      id: `test_dup_c_${timestamp}`,
+      filename: `logo-admir-copia-${timestamp}.webp`,
       originalName: 'logo-admir-copia-nao-utilizada.webp',
       organizedName: 'ADMIR_Logo_Copia_003',
       title: 'Cópia Antiga Sem Uso',
-      url: sharedUrl,
-      thumbUrl: sharedUrl,
+      url: urlC,
+      thumbUrl: urlC,
       mimeType: 'image/webp',
       sizeBytes: 45200,
       fileSize: '45.2 KB',

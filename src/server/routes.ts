@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { GoogleGenAI } from '@google/genai';
-import { db, RequestMetadata } from './db';
+import { db, RequestMetadata, resolveRuntimeEnvironment } from './db';
 import { PublicMediaStorage } from './storage';
 import { PrivateDocumentStorage } from './privateStorage';
 import { auditProductionGate } from './productionGate';
@@ -3080,18 +3080,41 @@ apiRouter.post('/sync/test-connection', requirePermission('sync.view'), async (r
   }
 });
 
-// READ-ONLY export of current data (used when this instance is queried as source)
-apiRouter.get('/sync/export-source', (req: Request, res) => {
+// READ-ONLY export of current data snapshot (Requires authenticated Owner/Manager or sync.export permission, or valid PROD_SYNC_TOKEN)
+apiRouter.get('/sync/export-source', (req: AuthenticatedRequest, res: Response) => {
   const syncToken = process.env.PROD_SYNC_TOKEN || process.env.ADMIR_PROD_SYNC_TOKEN;
   const authHeader = req.headers['authorization'];
   const tokenHeader = req.headers['x-sync-token'];
 
-  // Check token if configured
-  if (syncToken) {
+  let authorized = false;
+
+  // 1. Verify PROD_SYNC_TOKEN if explicitly set in process.env
+  if (syncToken && syncToken.trim().length > 0) {
     const provided = tokenHeader || (authHeader?.startsWith('Bearer ') ? authHeader.replace('Bearer ', '').trim() : null);
-    if (provided !== syncToken) {
-      return res.status(401).json({ error: 'Token de sincronização inválido ou ausente.' });
+    if (provided === syncToken) {
+      authorized = true;
     }
+  }
+
+  // 2. Verify authenticated user (req.user resolved by resolveUser middleware)
+  if (!authorized && req.user) {
+    if (
+      req.user.role === 'owner' ||
+      req.user.role === 'manager' ||
+      req.user.permissions?.['sync.export'] ||
+      req.user.permissions?.['sync.execute'] ||
+      req.user.permissions?.['sync.view']
+    ) {
+      authorized = true;
+    }
+  }
+
+  // Handle unauthorized/unauthenticated cases
+  if (!authorized) {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Não autenticado. Faça login como Administrador para exportar snapshot de dados.' });
+    }
+    return res.status(403).json({ error: 'Acesso negado: permissão de exportação de dados obrigatória.' });
   }
 
   try {
@@ -3170,13 +3193,61 @@ apiRouter.get('/sync/history', requirePermission('sync.view'), (req: Authenticat
    ========================================================================= */
 
 // Production Gate Audit Endpoint (Non-destructive, provides verification checklist)
-apiRouter.get('/system/production-gate', (req: Request, res: Response) => {
+apiRouter.get('/system/production-gate', (req: AuthenticatedRequest, res: Response) => {
   try {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Não autenticado. Por favor, faça login.' });
+    }
+
+    const isOwner = req.user.role === 'owner';
+    const hasSyncView = req.user.permissions && req.user.permissions['sync.view'];
+    if (!isOwner && !hasSyncView) {
+      return res.status(403).json({ error: 'Acesso negado: permissão de administrador necessária.' });
+    }
+
     const audit = auditProductionGate();
     res.json(audit);
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Falha ao auditar Production Gate.' });
   }
+});
+
+// Environment Simulation Endpoint for ADMIR-P015 Compliance Checks
+apiRouter.get('/system/simulate-env', (req: Request, res: Response) => {
+  const actualEnv = resolveRuntimeEnvironment({
+    host: req.headers.host || '',
+    xForwardedHost: req.headers['x-forwarded-host'] as string || '',
+  });
+
+  if (actualEnv !== 'development') {
+    res.status(404).json({ error: 'Rota API não encontrada: GET /api/system/simulate-env' });
+    return;
+  }
+
+  const simHost = (req.query.host as string) || '';
+  const simAppEnv = (req.query.appEnv as string) || '';
+  const simKService = (req.query.kService as string) || '';
+
+  const context = {
+    host: simHost || undefined,
+    appEnv: simAppEnv || undefined,
+    kService: simKService || undefined,
+  };
+
+  const resolved = resolveRuntimeEnvironment(context);
+  const expectedDataSource =
+    resolved === 'production'
+      ? 'prod_app_state'
+      : resolved === 'development'
+      ? 'dev_app_state'
+      : 'unknown / ENVIRONMENT_CONFLICT';
+
+  res.json({
+    simulatedContext: context,
+    resolvedEnvironment: resolved,
+    expectedDataSource,
+    prodFirestoreCalls: 0,
+  });
 });
 
 

@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import {
   SyncableModuleId,
   SyncModuleInfo,
@@ -15,7 +16,7 @@ import {
   SyncConnectionTestResult,
   User,
 } from '../types';
-import { db, RequestMetadata } from './db';
+import { db, RequestMetadata, isProductionEnvironment } from './db';
 
 const BACKUPS_DIR = path.resolve(process.cwd(), 'data', 'backups');
 const SYNC_HISTORY_FILE = path.resolve(process.cwd(), 'data', 'sync_history.json');
@@ -336,10 +337,26 @@ export class SyncService {
    */
   public async fetchSourceData(providedSnapshot?: any): Promise<{ data: any; sourceMode: string; sourceUrl?: string }> {
     if (providedSnapshot && typeof providedSnapshot === 'object') {
+      let dataToUse = providedSnapshot;
+      let snapshotEnv = 'desconhecido';
+
+      if (providedSnapshot.metadata && providedSnapshot.data) {
+        const { metadata, data } = providedSnapshot;
+        snapshotEnv = metadata.environment || snapshotEnv;
+
+        if (metadata.checksum) {
+          const calculatedHash = crypto.createHash('sha256').update(JSON.stringify(data)).digest('hex');
+          if (calculatedHash !== metadata.checksum) {
+            throw new Error('[CHECKSUM_MISMATCH] O arquivo de snapshot selecionado foi alterado ou corrompido. O checksum SHA-256 não é válido.');
+          }
+        }
+        dataToUse = data;
+      }
+
       return {
-        data: this.sanitizeIncomingData(providedSnapshot),
+        data: this.sanitizeIncomingData(dataToUse),
         sourceMode: 'snapshot_payload',
-        sourceUrl: 'Snapshot Oficial de Produção (Upload)',
+        sourceUrl: `Snapshot Manual de Produção (Upload - Env: ${snapshotEnv})`,
       };
     }
 
@@ -374,8 +391,9 @@ export class SyncService {
       }
 
       const payload = await response.json();
+      const payloadData = payload.data || payload;
       return {
-        data: this.sanitizeIncomingData(payload),
+        data: this.sanitizeIncomingData(payloadData),
         sourceMode: 'direct_api',
         sourceUrl: cleanUrl,
       };
@@ -385,11 +403,38 @@ export class SyncService {
   }
 
   /**
-   * Exports sanitized data for when this instance acts as source (READ-ONLY)
+   * Exports sanitized data with metadata and SHA-256 checksum for when this instance acts as source (READ-ONLY)
    */
   public exportSourceData(): any {
+    if (isProductionEnvironment() && (db as any).isProductionBlocked) {
+      throw new Error('[EXPORT_BLOCKED] O ambiente de Produção não concluiu a hidratação segura do datastore. Exportação de snapshot bloqueada.');
+    }
+
     const raw = this.getTargetData();
-    return this.sanitizeIncomingData(raw);
+    const sanitizedData = this.sanitizeIncomingData(raw);
+
+    const recordCounts: Record<string, number> = {};
+    for (const mod of this.getAvailableModules()) {
+      recordCounts[mod.id] = this.getModuleRecords(sanitizedData, mod.id as SyncableModuleId).length;
+    }
+
+    const dataJson = JSON.stringify(sanitizedData);
+    const checksum = crypto.createHash('sha256').update(dataJson).digest('hex');
+
+    const metadata = {
+      schemaVersion: '1.0',
+      generatedAt: new Date().toISOString(),
+      environment: isProductionEnvironment() ? 'production' : 'development',
+      source: 'ADMIR',
+      snapshotType: 'FULL_DATABASE',
+      recordCounts,
+      checksum,
+    };
+
+    return {
+      metadata,
+      data: sanitizedData,
+    };
   }
 
   /**

@@ -257,14 +257,18 @@ export function DataSyncManager() {
   const handleExportLocalSnapshot = async () => {
     try {
       const data = await exportCurrentDataSnapshot();
+      const env = data.metadata?.environment === 'production' ? 'production' : 'development';
+      const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+      const filename = `admir-${env}-snapshot-${timestamp}.json`;
+
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `admir_snapshot_dev_${new Date().toISOString().slice(0, 10)}.json`;
+      a.download = filename;
       a.click();
       URL.revokeObjectURL(url);
-      showToast('Snapshot local exportado com sucesso.', 'success');
+      showToast(`Snapshot (${env === 'production' ? 'PRODUÇÃO' : 'DESENVOLVIMENTO'}) exportado com sucesso: ${filename}`, 'success');
     } catch (e: any) {
       showToast(e.message || 'Erro ao exportar snapshot.', 'error');
     }
@@ -405,6 +409,54 @@ export function DataSyncManager() {
       {/* TAB 1: SYNCHRONIZER & DRY RUN */}
       {activeTab === 'sync' && (
         <div className="space-y-6">
+          {/* Section: Export Snapshot of Current Environment */}
+          <div className="bg-slate-900 text-white rounded-2xl p-6 border border-slate-800 shadow-sm space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <Download className="w-5 h-5 text-amber-400" />
+                  <h3 className="text-base font-bold text-white uppercase tracking-wide">EXPORTAÇÃO DE SNAPSHOT</h3>
+                  <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                    Base Completa
+                  </span>
+                </div>
+                <p className="text-slate-300 text-xs">
+                  Gere um snapshot sanitizado e assinado com checksum SHA-256 a partir da fonte oficial do ambiente atual.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleExportLocalSnapshot}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 active:scale-98 text-white text-xs font-bold transition shadow-md self-start sm:self-auto shrink-0"
+              >
+                <Download className="w-4 h-4" />
+                Exportar Snapshot deste Ambiente
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-3 text-xs border-t border-slate-800/80">
+              <div className="flex items-center gap-2 text-slate-300">
+                <Server className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>
+                  Ambiente atual: <strong className="text-white">{statusInfo?.targetEnvironment?.includes('Produção') ? 'PRODUÇÃO' : 'DESENVOLVIMENTO'}</strong>
+                </span>
+              </div>
+              <div className="flex items-center gap-2 text-slate-300">
+                <Info className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>Escopo: <strong className="text-white">Base Completa Sanitizada</strong></span>
+              </div>
+              <div className="flex items-center gap-2 text-slate-300">
+                <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>
+                  {statusInfo?.targetEnvironment?.includes('Produção')
+                    ? 'Este snapshot será gerado a partir dos dados atuais deste ambiente de Produção. Nenhum dado será alterado.'
+                    : 'Este snapshot será gerado a partir dos dados locais de Desenvolvimento. Identificado estritamente como DESENVOLVIMENTO.'}
+                </span>
+              </div>
+            </div>
+          </div>
+
           {/* Step 1: Source Provider Selection */}
           <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
             <div className="flex items-center justify-between">

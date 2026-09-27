@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { db } from './db';
+import { db, isProductionEnvironment } from './db';
 import { PublicMediaStorage } from './storage';
 import { PrivateDocumentStorage } from './privateStorage';
 
@@ -42,9 +42,6 @@ export interface ProductionGateAuditResult {
   };
 }
 
-export function isProductionEnvironment(): boolean {
-  return process.env.NODE_ENV === 'production' || process.env.APP_ENV === 'production';
-}
 
 /**
  * Runs the comprehensive 11-point Production Gate verification.

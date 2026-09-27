@@ -3,6 +3,7 @@ import { MediaAsset, MediaAIJob, User } from '../types';
 import { analyzeImageWithGemini } from './aiMediaService';
 import { PublicMediaStorage } from './storage';
 import { GEMINI_MODEL, AI_ANALYSIS_VERSION, aiRateLimiter } from './aiUtils';
+import { calculateSHA256 } from './duplicateDetector';
 
 let isWorkerRunning = false;
 
@@ -259,6 +260,65 @@ async function processJob(jobId: string) {
       throw new Error('Falha ao recuperar arquivo para análise.');
     }
 
+    // Determine SHA-256 for exact content cache identity
+    const contentSha256 = asset.sha256 || calculateSHA256(buffer);
+
+    // Cross-Media Cache Check: SHA-256 + Model + AnalysisVersion
+    const cachedSource = db.getMedia().find(m => 
+      m.id !== mediaId &&
+      m.sha256 === contentSha256 &&
+      m.aiAnalyzed === true &&
+      m.aiStatus === 'ANALYZED' &&
+      m.aiModel === GEMINI_MODEL &&
+      m.aiAnalysisVersion === AI_ANALYSIS_VERSION
+    );
+
+    if (cachedSource) {
+      console.log(`[AI_ANALYSIS_CACHE_HIT] Target: ${mediaId}, Source: ${cachedSource.id}, SHA: ${contentSha256.substring(0, 12)}..., Model: ${GEMINI_MODEL}, Version: ${AI_ANALYSIS_VERSION}`);
+      
+      const persistStart = Date.now();
+      db.updateMedia(mediaId, {
+        sha256: contentSha256,
+        aiAnalyzed: true,
+        aiAnalyzedAt: new Date().toISOString(),
+        aiModel: GEMINI_MODEL,
+        aiAnalysisVersion: AI_ANALYSIS_VERSION,
+        aiDescription: cachedSource.aiDescription,
+        aiSuggestedTitle: cachedSource.aiSuggestedTitle,
+        aiTags: cachedSource.aiTags,
+        aiSceneType: cachedSource.aiSceneType,
+        aiProbableEventType: cachedSource.aiProbableEventType,
+        aiVisibleText: cachedSource.aiVisibleText,
+        aiVisualContext: cachedSource.aiVisualContext,
+        aiConfidence: cachedSource.aiConfidence,
+        aiStatus: 'ANALYZED',
+        aiError: undefined,
+        // Only set title/altText if not already manually filled by human decision
+        title: asset.title || cachedSource.aiSuggestedTitle,
+        altText: asset.altText || cachedSource.aiDescription,
+        tags: Array.from(new Set([...(asset.tags || []), ...(cachedSource.aiTags || [])])),
+        eventName: asset.eventName || cachedSource.aiProbableEventType,
+      }, { name: 'AI_WORKER', email: 'ai-worker@admir.org' } as User);
+
+      const currentJobLatest = db.getAIJob(jobId);
+      if (currentJobLatest && currentJobLatest.status !== 'CANCELLED') {
+        db.updateAIJob(jobId, {
+          pendingMediaIds: pendingIds.slice(1),
+          processedMediaIds: [...currentJobLatest.processedMediaIds, mediaId],
+          processedItems: currentJobLatest.processedItems + 1,
+          successItems: currentJobLatest.successItems + 1,
+          skippedItems: currentJobLatest.skippedItems + 1,
+          lastMediaId: mediaId,
+          lastMediaName: asset.originalName || asset.filename
+        });
+      }
+
+      const persistenceMs = Date.now() - persistStart;
+      const totalItemMs = Date.now() - itemStartTime;
+      console.log(`[AI_Performance_Metric] Media ${mediaId} (${asset.originalName}) [CACHE_HIT]: DOWNLOAD=${downloadTimeMs}ms, PERSIST=${persistenceMs}ms, TOTAL=${totalItemMs}ms`);
+      return;
+    }
+
     // 2. Image Preparation (base64 conversion)
     const prepStart = Date.now();
     const base64Data = buffer.toString('base64');
@@ -285,6 +345,7 @@ async function processJob(jobId: string) {
     // 4. Persistence Time
     const persistStart = Date.now();
     db.updateMedia(mediaId, {
+      sha256: contentSha256,
       aiAnalyzed: true,
       aiAnalyzedAt: new Date().toISOString(),
       aiModel: GEMINI_MODEL,

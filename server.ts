@@ -8,10 +8,15 @@ import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { apiRouter } from './src/server/routes';
+import { db } from './src/server/db';
 import { startAIWorker } from './src/server/aiMediaWorker';
 
 async function startServer() {
   (global as any).__startup_timers.startServerStart = performance.now();
+  
+  // Hydrate persistent database from Firestore before serving traffic
+  await db.initPersistentStore();
+
   const app = express();
   const PORT = 3000;
 

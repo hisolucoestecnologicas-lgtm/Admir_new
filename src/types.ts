@@ -105,6 +105,7 @@ export interface GranularPermissions {
 
   // Data Synchronization (Sincronização de Dados Produção → Dev)
   'sync.view'?: boolean;
+  'sync.export'?: boolean;
   'sync.preview'?: boolean;
   'sync.execute'?: boolean;
   'sync.restore'?: boolean;
@@ -249,6 +250,7 @@ export const PERMISSION_GROUPS: PermissionGroup[] = [
     group: 'Sincronização de Ambientes (Prod → Dev)',
     permissions: [
       { key: 'sync.view', label: 'Visualizar Painel de Sincronização' },
+      { key: 'sync.export', label: 'Exportar Snapshot de Dados do Ambiente' },
       { key: 'sync.preview', label: 'Executar Análise / Dry Run' },
       { key: 'sync.execute', label: 'Executar Sincronização (Produção → Dev)' },
       { key: 'sync.restore', label: 'Restaurar Snapshot de Backup' },
